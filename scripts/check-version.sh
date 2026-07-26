@@ -4,7 +4,13 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)
-TAG="${1:-${GITHUB_REF_NAME:-v$VERSION}}"
+TAG="${1:-}"
+if [ -z "$TAG" ]; then
+    case "${GITHUB_REF_NAME:-}" in
+        v*) TAG="$GITHUB_REF_NAME" ;;
+        *) TAG="v$VERSION" ;;
+    esac
+fi
 MANIFEST_VERSION=$(
     sed -n 's/^[[:space:]]*"version": "\(.*\)",/\1/p' \
         "$ROOT/packaging/appload/external.manifest.json" |
