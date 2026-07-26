@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a reproducible problem with Horcrux
+title: "[Bug]: "
+labels:
+  - bug
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Horcrux. Remove API keys, private diary
+        text, page images, and personal information before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: Horcrux version
+      description: Release tag or commit SHA
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: reMarkable OS version
+      placeholder: 3.22.4.2
+    validations:
+      required: true
+  - type: input
+    id: display
+    attributes:
+      label: rm2display/rm2fb version
+      description: Include the exact build or commit if known.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Pen or eraser input
+        - Display or animation
+        - Oracle/model request
+        - Memory
+        - Daily journal
+        - Journal recall
+        - AppLoad or systemd launcher
+        - Build or packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Explain the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Tom's Diary
+        2. Write ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: |
+        Paste only relevant, redacted output from journalctl or
+        /tmp/horcrux.log. Never include horcrux.env.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and private diary content.
+          required: true

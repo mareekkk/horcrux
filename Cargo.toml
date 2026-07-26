@@ -2,8 +2,15 @@
 name = "horcrux"
 version = "0.1.0"
 edition = "2021"
+authors = ["Marek"]
 license = "MIT"
-description = "Tom Riddle's diary for the reMarkable 2 e-ink tablet"
+description = "A self-writing, remembering diary for the reMarkable 2 e-ink tablet"
+readme = "README.md"
+repository = "https://github.com/mareekkk/horcrux"
+homepage = "https://github.com/mareekkk/horcrux"
+keywords = ["remarkable", "remarkable2", "eink", "handwriting", "journal"]
+categories = ["embedded", "multimedia::graphics"]
+publish = false
 
 [[bin]]
 name = "horcrux"

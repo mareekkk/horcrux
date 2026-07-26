@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose an addition or thematic improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+  - triage
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What should the diary do?
+      description: Describe the need or experience, not only the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: theme
+    attributes:
+      label: How does it fit the diary?
+      description: Explain how the behavior preserves the physical, enchanted-diary illusion.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include gestures, animations, storage, or configuration where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Final checks
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: This request does not include private diary content or credentials.
+          required: true

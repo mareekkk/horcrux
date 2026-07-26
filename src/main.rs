@@ -1,6 +1,6 @@
 //! horcrux — Tom Riddle's diary on a reMarkable 2.
 //!
-//! Write with the pen; after 2.8s idle the ink is drunk away, a vision LLM
+//! Write with the pen; after a short idle the ink is drunk away, a vision LLM
 //! (the "oracle") answers, and the reply writes itself on the page in
 //! animated handwriting. Five-finger tap on the touchscreen quits.
 //!
@@ -30,15 +30,11 @@ use surface::{Rect, Surface};
 const PAGE_PNG_PATH: &str = "/tmp/horcrux-page.png";
 
 const LOOP_MS: u64 = 2;
-const IDLE_COMMIT_MS: u128 = 3800;
 const INK_FLUSH_MS: u64 = 15;
 const MIN_PRESSURE: i32 = 40;
 
 const DRINK_STAGES: u8 = 26;
-const DRINK_STAGE_MS: u64 = 140;
 
-const REPLY_TICK_MS: u64 = 16;
-const REPLY_POINTS_PER_TICK: usize = 12;
 /// Delay between a reply segment's speckle pass and its solidify pass.
 const SOLIDIFY_MS: u64 = 120;
 const REPLY_BRUSH_R: i32 = 2;
@@ -48,7 +44,6 @@ const LINGER_PER_POINT_MS: u64 = 1;
 const LINGER_CAP_MS: u64 = 20_000;
 
 const FADE_STAGES: u8 = 26;
-const FADE_STAGE_MS: u64 = 140;
 
 // journal: auto-composed entry lingers briefly, conjured entries replay
 // fast and faded
@@ -58,6 +53,40 @@ const CONJURE_POINTS_PER_TICK: usize = 48;
 const CONJURE_LINGER_MS: u64 = 2500;
 
 static QUIT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+struct AnimationConfig {
+    idle_ms: u64,
+    drink_stage_ms: u64,
+    write_tick_ms: u64,
+    write_points_per_tick: usize,
+    fade_stage_ms: u64,
+}
+
+impl AnimationConfig {
+    fn from_env() -> AnimationConfig {
+        AnimationConfig {
+            idle_ms: env_u64("HORCRUX_IDLE_MS", 3800, 250, 60_000),
+            drink_stage_ms: env_u64("HORCRUX_DRINK_STAGE_MS", 140, 20, 2000),
+            write_tick_ms: env_u64("HORCRUX_WRITE_TICK_MS", 16, 4, 500),
+            write_points_per_tick: env_u64("HORCRUX_WRITE_POINTS_PER_TICK", 12, 1, 128) as usize,
+            fade_stage_ms: env_u64("HORCRUX_FADE_STAGE_MS", 140, 20, 2000),
+        }
+    }
+}
+
+fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(value) if (min..=max).contains(&value) => value,
+            _ => {
+                log!("ignoring invalid {name}; expected {min}..={max}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 extern "C" fn on_signal(_sig: libc::c_int) {
     QUIT.store(true, Ordering::SeqCst);
@@ -100,6 +129,22 @@ enum State {
 }
 
 fn main() {
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("horcrux {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "-h" | "--help" => {
+                println!(
+                    "horcrux {}\n\nTom's Diary for the reMarkable 2\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show the version",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
     std::panic::set_hook(Box::new(|info| {
         log!("panic: {info}");
     }));
@@ -123,7 +168,11 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    log!("horcrux starting (pid {})", std::process::id());
+    log!(
+        "horcrux {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
     let oracle_cfg = OracleConfig::from_env();
     if oracle_cfg.is_none() {
         log!("warning: HORCRUX_OPENAI_KEY unset — turns will fail politely");
@@ -142,6 +191,7 @@ struct App {
     input: Input,
     memory: Memory,
     oracle_cfg: Option<OracleConfig>,
+    animation: AnimationConfig,
     state: State,
 
     // journal configuration
@@ -196,12 +246,17 @@ struct Conjure {
 impl App {
     fn new(surf: Surface, input: Input, memory: Memory, oracle_cfg: Option<OracleConfig>) -> App {
         let now = Instant::now();
-        let journal_dir = journal::journal_dir(memory.dir());
+        let journal_dir = std::env::var("HORCRUX_JOURNAL_DIR")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| journal::journal_dir(memory.dir()));
         App {
             surf,
             input,
             memory,
             oracle_cfg,
+            animation: AnimationConfig::from_env(),
             state: State::Listening,
             journal_enabled: std::env::var("HORCRUX_JOURNAL")
                 .map(|v| v != "off")
@@ -317,9 +372,7 @@ impl App {
         if journal::entry_path(&self.journal_dir, &today).exists() {
             return false;
         }
-        let pages = self
-            .memory
-            .pages_on(&today, self.tz_offset_hours, journal::MAX_JOURNAL_PAGES);
+        let pages = self.memory.pages_on(&today, self.tz_offset_hours);
         if pages.is_empty() {
             return false;
         }
@@ -408,7 +461,7 @@ impl App {
     fn maybe_commit(&mut self) {
         if self.pen_down
             || self.ink.is_empty()
-            || self.last_activity.elapsed().as_millis() < IDLE_COMMIT_MS
+            || self.last_activity.elapsed().as_millis() < self.animation.idle_ms as u128
         {
             return;
         }
@@ -619,7 +672,7 @@ impl App {
                 1,
             );
         }
-        let mut budget = REPLY_POINTS_PER_TICK;
+        let mut budget = self.animation.write_points_per_tick;
         if let Some(plan) = &self.plan {
             while budget > 0 && self.draw_si < plan.strokes.len() {
                 let stroke = &plan.strokes[self.draw_si];
@@ -690,7 +743,7 @@ impl App {
             }
             return;
         }
-        let next = Instant::now() + Duration::from_millis(REPLY_TICK_MS);
+        let next = Instant::now() + Duration::from_millis(self.animation.write_tick_ms);
         self.state = if journal {
             State::Journaling { next }
         } else {
@@ -882,7 +935,7 @@ impl App {
                 } else {
                     self.state = State::Drinking {
                         stage: stage + 1,
-                        next: next + Duration::from_millis(DRINK_STAGE_MS),
+                        next: next + Duration::from_millis(self.animation.drink_stage_ms),
                     };
                 }
             }
@@ -940,7 +993,7 @@ impl App {
                 } else {
                     self.state = State::FadingReply {
                         stage: stage + 1,
-                        next: next + Duration::from_millis(FADE_STAGE_MS),
+                        next: next + Duration::from_millis(self.animation.fade_stage_ms),
                     };
                 }
             }

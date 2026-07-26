@@ -15,8 +15,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Most recent pages of a day offered to the journal prompt.
-pub const MAX_JOURNAL_PAGES: usize = 40;
 /// Entries with more stored points are talked about instead of conjured.
 pub const CONJURE_MAX_POINTS: usize = 4000;
 /// Conjured ink is faded, not black.

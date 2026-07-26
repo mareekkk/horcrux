@@ -71,17 +71,16 @@ impl Memory {
         &self.dir
     }
 
-    /// Pages written on local date `ymd`, chronological, capped at the most
-    /// recent `cap` of the day. (id = unix seconds.)
-    pub fn pages_on(&self, ymd: &str, tz_offset_hours: i32, cap: usize) -> Vec<HistoryTurn> {
-        if !self.enabled || cap == 0 {
+    /// Every retained page written on local date `ymd`, chronological.
+    /// The global memory store already caps retention at `MAX_PAGES`.
+    pub fn pages_on(&self, ymd: &str, tz_offset_hours: i32) -> Vec<HistoryTurn> {
+        if !self.enabled {
             return Vec::new();
         }
         let Ok(text) = fs::read_to_string(self.dir.join(INDEX_FILE)) else {
             return Vec::new();
         };
-        let mut matching: Vec<HistoryTurn> = text
-            .lines()
+        text.lines()
             .filter_map(|line| {
                 let mut f = line.split('\t');
                 let (id, t, r) = (f.next()?, f.next()?, f.next()?);
@@ -93,10 +92,7 @@ impl Memory {
                     None
                 }
             })
-            .collect();
-        let excess = matching.len().saturating_sub(cap);
-        matching.drain(..excess);
-        matching
+            .collect()
     }
 
     #[cfg(test)]
@@ -240,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_on_caps_at_forty_and_filters_day() {
+    fn pages_on_includes_the_whole_day_and_filters_other_days() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -267,12 +263,10 @@ mod tests {
         fs::write(dir.join(INDEX_FILE), &index).unwrap();
 
         let mem = Memory::with_dir(dir.clone());
-        assert!(!mem.pages_on(&today, 0, 1).is_empty());
-        let pages = mem.pages_on(&today, 0, 40);
-        assert_eq!(pages.len(), 40);
-        // most recent 40 of the day: the oldest 5 are dropped
-        assert_eq!(pages[0].0, "wrote today-5");
-        assert_eq!(pages[39].0, "wrote today-44");
+        let pages = mem.pages_on(&today, 0);
+        assert_eq!(pages.len(), 45);
+        assert_eq!(pages[0].0, "wrote today-0");
+        assert_eq!(pages[44].0, "wrote today-44");
         // yesterday's pages are not in today's gather
         assert!(pages.iter().all(|(t, _)| !t.contains("yesterday")));
         let _ = fs::remove_dir_all(&dir);

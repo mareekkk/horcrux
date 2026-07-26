@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish
+    if: github.repository_owner == 'mareekkk'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Resolve tag
+        id: version
+        env:
+          PUSH_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          INPUT_TAG: ${{ inputs.tag || '' }}
+        run: |
+          TAG="${PUSH_TAG:-$INPUT_TAG}"
+          test -n "$TAG"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+      - name: Check out tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          targets: armv7-unknown-linux-gnueabihf
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Verify version metadata
+        run: scripts/check-version.sh "${{ steps.version.outputs.tag }}"
+      - name: Run release checks
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Install cross-build helper
+        run: cargo install cargo-zigbuild --locked --version 0.23.0
+      - name: Build ARMv7 release
+        run: scripts/build.sh
+      - name: Package release
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          scripts/package-release.sh dist
+      - name: Extract release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          awk -v version="$VERSION" '
+            index($0, "## [" version "] - ") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md >dist/release-notes.md
+          test -s dist/release-notes.md
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            dist/horcrux-*.tar.gz \
+            dist/horcrux-*.tar.gz.sha256 \
+            --verify-tag \
+            --title "Horcrux $TAG" \
+            --notes-file dist/release-notes.md
