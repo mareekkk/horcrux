@@ -1,0 +1,24 @@
+[package]
+name = "horcrux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Tom Riddle's diary for the reMarkable 2 e-ink tablet"
+
+[[bin]]
+name = "horcrux"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+png = "0.17"
+ab_glyph = "0.2"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true

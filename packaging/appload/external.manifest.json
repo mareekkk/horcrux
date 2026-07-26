@@ -1,0 +1,10 @@
+{
+  "id": "horcrux",
+  "name": "Tom's Diary",
+  "version": "0.1.0",
+  "description": "An enchanted diary: write to it with the pen — it writes back, and it remembers.",
+  "application": "/bin/systemctl",
+  "args": ["start", "horcrux"],
+  "qtfb": false,
+  "disablesWindowedMode": true
+}

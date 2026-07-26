@@ -1,0 +1,12 @@
+[Unit]
+Description=Tom's Diary (horcrux)
+Conflicts=xochitl.service
+After=xochitl.service rm2fb.socket
+
+[Service]
+Type=simple
+ExecStart=/home/root/horcrux/horcrux-run.sh
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
