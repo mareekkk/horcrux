@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 use surface::{Rect, Surface};
 
 const PAGE_PNG_PATH: &str = "/tmp/horcrux-page.png";
+const DEFAULT_TZ_NAME: &str = "Australia/Perth";
+const DEFAULT_TZ_OFFSET_HOURS: i32 = 8;
+const DEFAULT_LIBRARY_DIR: &str = "/home/root/.local/share/remarkable/xochitl";
 
 const LOOP_MS: u64 = 2;
 const INK_FLUSH_MS: u64 = 15;
@@ -37,11 +40,10 @@ const DRINK_STAGES: u8 = 26;
 
 /// Delay between a reply segment's speckle pass and its solidify pass.
 const SOLIDIFY_MS: u64 = 120;
-const REPLY_BRUSH_R: i32 = 2;
-
-const LINGER_BASE_MS: u64 = 0;
-const LINGER_PER_POINT_MS: u64 = 1;
-const LINGER_CAP_MS: u64 = 20_000;
+/// A one-pixel radius keeps the handwriting delicate rather than heavy.
+const REPLY_BRUSH_R: i32 = 1;
+/// Time a completed ordinary reply remains still before it starts fading.
+const REPLY_LINGER_MS: u64 = 4_000;
 
 const FADE_STAGES: u8 = 26;
 
@@ -51,6 +53,9 @@ const JOURNAL_LINGER_MS: u64 = 2000;
 const CONJURE_TICK_MS: u64 = 10;
 const CONJURE_POINTS_PER_TICK: usize = 48;
 const CONJURE_LINGER_MS: u64 = 2500;
+const MAX_REPLY_SENTENCES: usize = 3;
+const MAX_REPLY_WORDS: usize = 55;
+const MAX_REPLY_CHARS: usize = 420;
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -99,9 +104,11 @@ enum State {
         stage: u8,
         next: Instant,
     },
-    /// Waiting on the oracle's first sentence; the page stays blank (no
+    /// Waiting on the oracle's complete reply; the page stays blank (no
     /// blinking indicator — it read as a defect on the e-ink panel).
     Thinking,
+    /// Waiting for the complete journal entry before fitting it to the page.
+    JournalThinking,
     Replying {
         next: Instant,
     },
@@ -137,9 +144,24 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "horcrux {}\n\nTom's Diary for the reMarkable 2\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show the version",
+                    "horcrux {}\n\nTom's Diary for the reMarkable 2\n\nOptions:\n  -h, --help          Show this help\n  -V, --version       Show the version\n      --publish-diary Rebuild the Markdown diary and stock-library EPUB",
                     env!("CARGO_PKG_VERSION")
                 );
+                return;
+            }
+            "--publish-diary" => {
+                let memory = Memory::from_env();
+                let journal_dir = configured_journal_dir(&memory);
+                let library_dir = configured_library_dir();
+                let time_context =
+                    journal::current_time_context(&configured_tz_name(), configured_tz_offset());
+                match journal::publish_diary(&journal_dir, &library_dir, &time_context) {
+                    Ok(path) => println!("published {}", path.display()),
+                    Err(error) => {
+                        eprintln!("horcrux: diary publish failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
                 return;
             }
             _ => {}
@@ -196,8 +218,10 @@ struct App {
 
     // journal configuration
     journal_enabled: bool,
+    tz_name: String,
     tz_offset_hours: i32,
     journal_dir: PathBuf,
+    library_dir: PathBuf,
 
     // live ink (Listening)
     ink: Ink,
@@ -246,11 +270,7 @@ struct Conjure {
 impl App {
     fn new(surf: Surface, input: Input, memory: Memory, oracle_cfg: Option<OracleConfig>) -> App {
         let now = Instant::now();
-        let journal_dir = std::env::var("HORCRUX_JOURNAL_DIR")
-            .ok()
-            .filter(|path| !path.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| journal::journal_dir(memory.dir()));
+        let journal_dir = configured_journal_dir(&memory);
         App {
             surf,
             input,
@@ -261,11 +281,10 @@ impl App {
             journal_enabled: std::env::var("HORCRUX_JOURNAL")
                 .map(|v| v != "off")
                 .unwrap_or(true),
-            tz_offset_hours: std::env::var("HORCRUX_TZ_OFFSET")
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0),
+            tz_name: configured_tz_name(),
+            tz_offset_hours: configured_tz_offset(),
             journal_dir,
+            library_dir: configured_library_dir(),
             ink: Ink::new(),
             pen_down: false,
             last_pt: None,
@@ -328,7 +347,9 @@ impl App {
                 // a second quit during journal composition skips the entry
                 if matches!(
                     self.state,
-                    State::Journaling { .. } | State::JournalLingering { .. }
+                    State::JournalThinking
+                        | State::Journaling { .. }
+                        | State::JournalLingering { .. }
                 ) {
                     log!("quit during journaling — skipping the entry");
                     return true;
@@ -369,15 +390,12 @@ impl App {
             return false;
         }
         let today = journal::today_ymd(self.tz_offset_hours);
-        if journal::entry_path(&self.journal_dir, &today).exists() {
-            return false;
-        }
         let pages = self.memory.pages_on(&today, self.tz_offset_hours);
         if pages.is_empty() {
             return false;
         }
         log!(
-            "composing journal entry for {today} ({} pages)",
+            "composing updated journal entry for {today} ({} pages)",
             pages.len()
         );
         let prompt = journal::build_journal_prompt(&pages, &today);
@@ -398,11 +416,10 @@ impl App {
             .wrapping_add(1013904223);
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
-        oracle::spawn_text(self.oracle_cfg.clone(), prompt, tx);
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        oracle::spawn_text(self.oracle_cfg.clone(), prompt, time_context, tx);
         self.surf.full_white_refresh();
-        self.state = State::Journaling {
-            next: Instant::now(),
-        };
+        self.state = State::JournalThinking;
         true
     }
 
@@ -504,10 +521,12 @@ impl App {
         let journal_today = self
             .journal_enabled
             .then(|| journal::today_ymd(self.tz_offset_hours));
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
         oracle::spawn(
             self.oracle_cfg.clone(),
             png,
             self.memory.history(),
+            time_context,
             journal_today,
             tx,
         );
@@ -531,12 +550,10 @@ impl App {
                 events.push(ev);
             }
         }
-        let mut got_ink = false;
         for ev in events {
             match ev {
                 OracleEvent::Ink(s) => {
                     self.reply_sentences.push(s);
-                    got_ink = true;
                 }
                 OracleEvent::Transcript(t) => {
                     self.transcript = t;
@@ -553,14 +570,6 @@ impl App {
                 }
             }
         }
-        if got_ink
-            && matches!(
-                self.state,
-                State::Thinking | State::Replying { .. } | State::Journaling { .. }
-            )
-        {
-            self.replan();
-        }
     }
 
     fn begin_reply(&mut self) {
@@ -576,6 +585,7 @@ impl App {
             self.state = State::Listening;
             return;
         }
+        constrain_reply(&mut self.reply_sentences);
         self.replan();
         self.state = State::Replying {
             next: Instant::now(),
@@ -626,19 +636,24 @@ impl App {
         }
     }
 
-    /// (Re)plan the handwriting for the full reply text. Greedy wrap keeps
-    /// earlier lines stable, so already-drawn strokes are an exact prefix.
+    /// Plan the complete reply after streaming ends, allowing the handwriting
+    /// fitter to choose a font size and center the complete ink block while
+    /// keeping every line visible.
     fn replan(&mut self) {
         if self.reply_sentences.is_empty() {
             return;
         }
-        // Each sentence is its own paragraph, so a newly arrived sentence
-        // always starts a fresh line: earlier lines (and their strokes)
-        // never change, keeping the plan prefix-stable.
-        let plan_text = self.reply_sentences.join("\n");
-        let block_top = self.plan.as_ref().map(|p| p.block_top);
-        match script::plan_reply(&plan_text, block_top, self.turn_seed) {
-            Some(plan) => self.plan = Some(plan),
+        let plan_text = self.reply_sentences.join(" ");
+        match script::plan_reply(&plan_text, self.turn_seed) {
+            Some(plan) => {
+                log!(
+                    "reply layout: {} lines at {:.0}px, top {}",
+                    plan.line_count,
+                    plan.font_px,
+                    plan.block_top
+                );
+                self.plan = Some(plan);
+            }
             None => log!("handwriting plan failed"),
         }
     }
@@ -770,7 +785,19 @@ impl App {
                 .map(|p| p.strokes.clone())
                 .unwrap_or_default();
             match journal::save_entry(&self.journal_dir, &today, &text, &strokes) {
-                Ok(()) => log!("journal entry saved for {today}"),
+                Ok(()) => {
+                    log!("journal entry saved for {today}");
+                    let time_context =
+                        journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+                    match journal::publish_diary(
+                        &self.journal_dir,
+                        &self.library_dir,
+                        &time_context,
+                    ) {
+                        Ok(path) => log!("stock-library diary refreshed from {}", path.display()),
+                        Err(error) => log!("stock-library diary refresh failed: {error}"),
+                    }
+                }
                 Err(e) => log!("journal save failed: {e}"),
             }
         }
@@ -833,11 +860,9 @@ impl App {
     }
 
     fn enter_lingering(&mut self) {
-        let points = self.plan.as_ref().map(|p| p.total_points).unwrap_or(0) as u64;
-        let dur = (LINGER_BASE_MS + LINGER_PER_POINT_MS * points).min(LINGER_CAP_MS);
-        log!("turn complete, lingering {}ms", dur);
+        log!("turn complete, lingering {}ms", REPLY_LINGER_MS);
         self.state = State::Lingering {
-            until: Instant::now() + Duration::from_millis(dur),
+            until: Instant::now() + Duration::from_millis(REPLY_LINGER_MS),
         };
         self.save_turn();
     }
@@ -867,7 +892,7 @@ impl App {
                 p.strokes
                     .iter()
                     .flatten()
-                    .map(|&(x, y)| (x, y, 2))
+                    .map(|&(x, y)| (x, y, REPLY_BRUSH_R))
                     .collect()
             })
             .unwrap_or_default();
@@ -927,7 +952,7 @@ impl App {
                     self.ink.clear();
                     self.dissolve = None;
                     self.drain_oracle();
-                    if !self.reply_sentences.is_empty() || self.oracle_done {
+                    if self.oracle_done {
                         self.begin_reply();
                     } else {
                         self.state = State::Thinking;
@@ -941,12 +966,11 @@ impl App {
             }
             State::Thinking => {
                 self.drain_oracle();
-                if !self.reply_sentences.is_empty() || self.oracle_done {
+                if self.oracle_done {
                     self.begin_reply();
                 }
             }
             State::Replying { next } => {
-                self.drain_oracle();
                 if now >= next {
                     self.replay_tick(false);
                 }
@@ -956,8 +980,21 @@ impl App {
                     self.start_fading();
                 }
             }
-            State::Journaling { next } => {
+            State::JournalThinking => {
                 self.drain_oracle();
+                if self.oracle_done {
+                    if self.reply_sentences.is_empty() {
+                        log!("journal oracle returned no ink");
+                        self.want_quit = true;
+                    } else {
+                        self.replan();
+                        self.state = State::Journaling {
+                            next: Instant::now(),
+                        };
+                    }
+                }
+            }
+            State::Journaling { next } => {
                 if now >= next {
                     self.replay_tick(true);
                 }
@@ -1001,8 +1038,112 @@ impl App {
     }
 }
 
+fn configured_journal_dir(memory: &Memory) -> PathBuf {
+    std::env::var("HORCRUX_JOURNAL_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| journal::journal_dir(memory.dir()))
+}
+
+fn configured_library_dir() -> PathBuf {
+    std::env::var("HORCRUX_LIBRARY_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY_DIR))
+}
+
+fn configured_tz_name() -> String {
+    std::env::var("HORCRUX_TZ_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_TZ_NAME.to_string())
+}
+
+fn configured_tz_offset() -> i32 {
+    std::env::var("HORCRUX_TZ_OFFSET")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|offset| (-23..=23).contains(offset))
+        .unwrap_or(DEFAULT_TZ_OFFSET_HOURS)
+}
+
+/// Enforce the ordinary-reply contract even if the model ignores it. The
+/// planner still scales to fit, but this keeps handwriting legible rather than
+/// shrinking an unexpectedly huge response to a speck.
+fn constrain_reply(sentences: &mut Vec<String>) {
+    let original_sentence_count = sentences.len();
+    sentences.truncate(MAX_REPLY_SENTENCES);
+    let joined = sentences.join(" ");
+    let words: Vec<&str> = joined.split_whitespace().collect();
+    let mut constrained = words
+        .iter()
+        .take(MAX_REPLY_WORDS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut truncated =
+        original_sentence_count > MAX_REPLY_SENTENCES || words.len() > MAX_REPLY_WORDS;
+    if constrained.chars().count() > MAX_REPLY_CHARS {
+        constrained = constrained.chars().take(MAX_REPLY_CHARS).collect();
+        constrained = constrained.trim_end().to_string();
+        truncated = true;
+    }
+    if truncated {
+        constrained = constrained
+            .trim_end_matches(['.', '!', '?', '…'])
+            .trim_end()
+            .to_string();
+        constrained.push('…');
+        log!(
+            "reply constrained to {} words / {} characters",
+            constrained.split_whitespace().count(),
+            constrained.chars().count()
+        );
+    }
+    sentences.clear();
+    if !constrained.is_empty() {
+        sentences.push(constrained);
+    }
+}
+
 fn cleanup_page_png() {
     if std::path::Path::new(PAGE_PNG_PATH).exists() {
         let _ = std::fs::remove_file(PAGE_PNG_PATH);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_reply_is_bounded_even_when_model_overruns() {
+        let mut sentences = vec![
+            (0..30)
+                .map(|i| format!("first{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..30)
+                .map(|i| format!("second{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            "Third sentence.".to_string(),
+            "A forbidden fourth sentence.".to_string(),
+        ];
+        constrain_reply(&mut sentences);
+        assert_eq!(sentences.len(), 1);
+        assert!(sentences[0].split_whitespace().count() <= MAX_REPLY_WORDS);
+        assert!(sentences[0].chars().count() <= MAX_REPLY_CHARS + 1);
+        assert!(sentences[0].ends_with('…'));
+        assert!(!sentences[0].contains("forbidden fourth"));
+    }
+
+    #[test]
+    fn short_reply_is_unchanged_except_for_sentence_spacing() {
+        let mut sentences = vec!["One answer.".to_string(), "Another answer.".to_string()];
+        constrain_reply(&mut sentences);
+        assert_eq!(sentences, vec!["One answer. Another answer."]);
     }
 }

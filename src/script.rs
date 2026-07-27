@@ -1,16 +1,9 @@
 //! Handwriting synthesis.
 //!
-//! The reply is set in a script font at 96px (embedded Dancing Script, or
-//! `$HORCRUX_FONT` if set), each wrapped line is rasterized to a binary
-//! mask, the mask is thinned to a 1px skeleton (Zhang-Suen), and the
-//! skeleton is traced into stroke paths that replay left-to-right like ink
-//! being written.
-//!
-//! Determinism matters: replanning after more text arrives must reproduce
-//! the already-drawn strokes exactly. The caller therefore sends each
-//! sentence as its own paragraph (`\n`-separated): a new sentence always
-//! starts a fresh line, earlier lines never reflow, and per-line jitter is
-//! seeded by line index — so plans are prefix-stable.
+//! The complete reply is wrapped and fitted to the usable page before writing
+//! begins. The largest script size that fits between fixed top/bottom margins
+//! is selected, then each line is rasterized, thinned to a 1px skeleton
+//! (Zhang-Suen), and traced into left-to-right stroke paths.
 
 use ab_glyph::{point, Font, FontArc, ScaleFont};
 use std::sync::OnceLock;
@@ -38,12 +31,14 @@ fn font_bytes() -> &'static [u8] {
     FONT_BYTES
 }
 
-/// Raster size of the script font.
-pub const PX: f32 = 86.0;
+/// Largest and smallest reply font sizes considered by the page fitter.
+pub const MAX_PX: f32 = 86.0;
+const MIN_PX: i32 = 18;
 /// Left/right page margins.
 const MARGIN: i32 = 100;
-/// Line pitch.
-const LINE_H: i32 = 108;
+/// Minimum vertical breathing room used while selecting a fitting font size.
+const TOP_MARGIN: i32 = 72;
+const BOTTOM_MARGIN: i32 = 72;
 /// Padding around each line mask so swashes can overflow the advance box.
 const PAD: i32 = 24;
 
@@ -52,22 +47,27 @@ pub struct ReplyPlan {
     /// sorted by minimum x (left-to-right). Absolute screen coordinates.
     pub strokes: Vec<Vec<(i32, i32)>>,
     pub block_top: i32,
-    pub total_points: usize,
+    pub font_px: f32,
+    pub line_count: usize,
 }
 
-/// Plan the handwriting for `text`. Pass the `block_top` of an earlier plan
-/// of the same turn to keep appended text below what is already drawn.
-pub fn plan_reply(text: &str, block_top: Option<i32>, seed: u64) -> Option<ReplyPlan> {
+/// Plan the complete handwriting for `text`, selecting the largest font size
+/// whose wrapped lines all fit on the page.
+pub fn plan_reply(text: &str, seed: u64) -> Option<ReplyPlan> {
     let font = FontArc::try_from_slice(font_bytes()).ok()?;
     let max_w = crate::fb::WIDTH - 2 * MARGIN;
-
-    let lines = wrap(&font, text, max_w as f32);
-    if lines.is_empty() {
-        return None;
+    let available_h = crate::fb::HEIGHT - TOP_MARGIN - BOTTOM_MARGIN;
+    let mut fitted = None;
+    for px in (MIN_PX..=MAX_PX as i32).rev().step_by(2) {
+        let px = px as f32;
+        let lines = wrap(&font, text, max_w as f32, px);
+        let line_h = line_height(px);
+        if !lines.is_empty() && lines.len() as i32 * line_h <= available_h {
+            fitted = Some((lines, px, line_h));
+            break;
+        }
     }
-
-    let total_h = lines.len() as i32 * LINE_H;
-    let top = block_top.unwrap_or_else(|| ((crate::fb::HEIGHT - total_h) / 3).max(60));
+    let (lines, px, line_h) = fitted?;
 
     let mut rng = seed;
     let mut strokes = Vec::new();
@@ -75,48 +75,82 @@ pub fn plan_reply(text: &str, block_top: Option<i32>, seed: u64) -> Option<Reply
         // per-line vertical jitter +/-3px (LCG)
         rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
         let jitter = ((rng >> 16) % 7) as i32 - 3;
-        let line_y = top + i as i32 * LINE_H + jitter;
-        if line_y > crate::fb::HEIGHT - 40 {
-            break; // ran off the page — skip further lines
-        }
-        let mut line_strokes = trace_line(&font, line, line_y);
+        let line_y = TOP_MARGIN + i as i32 * line_h + jitter;
+        let mut line_strokes = trace_line(&font, line, line_y, px);
+        center_strokes_x(&mut line_strokes);
         line_strokes.sort_by_key(|s| s.iter().map(|p| p.0).min().unwrap_or(0));
         strokes.extend(line_strokes);
     }
     if strokes.is_empty() {
         return None;
     }
-    let total_points = strokes.iter().map(|s| s.len()).sum();
+    let (_, min_y, _, max_y) = stroke_bounds(&strokes)?;
+    let ink_h = max_y - min_y + 1;
+    let centered_top = (crate::fb::HEIGHT - ink_h) / 2;
+    let dy = centered_top - min_y;
+    for stroke in &mut strokes {
+        for (_, y) in stroke {
+            *y += dy;
+        }
+    }
     Some(ReplyPlan {
         strokes,
-        block_top: top,
-        total_points,
+        block_top: centered_top,
+        font_px: px,
+        line_count: lines.len(),
     })
 }
 
 // --- layout ------------------------------------------------------------------
 
-fn advance(font: &FontArc, s: &str) -> f32 {
-    let scaled = font.as_scaled(PX);
+fn center_strokes_x(strokes: &mut [Vec<(i32, i32)>]) {
+    let Some((min_x, _, max_x, _)) = stroke_bounds(strokes) else {
+        return;
+    };
+    let ink_w = max_x - min_x + 1;
+    let dx = (crate::fb::WIDTH - ink_w) / 2 - min_x;
+    for stroke in strokes {
+        for (x, _) in stroke {
+            *x += dx;
+        }
+    }
+}
+
+fn stroke_bounds(strokes: &[Vec<(i32, i32)>]) -> Option<(i32, i32, i32, i32)> {
+    let mut points = strokes.iter().flatten();
+    let &(first_x, first_y) = points.next()?;
+    Some(points.fold(
+        (first_x, first_y, first_x, first_y),
+        |(min_x, min_y, max_x, max_y), &(x, y)| {
+            (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+        },
+    ))
+}
+
+fn line_height(px: f32) -> i32 {
+    (px * 1.26).ceil() as i32
+}
+
+fn advance(font: &FontArc, s: &str, px: f32) -> f32 {
+    let scaled = font.as_scaled(px);
     s.chars().map(|c| scaled.h_advance(font.glyph_id(c))).sum()
 }
 
-/// Greedy word wrap. Crucially append-only stable: adding text at the end
-/// never changes the breaks of earlier lines.
-fn wrap(font: &FontArc, text: &str, max_w: f32) -> Vec<String> {
-    let space_w = advance(font, " ");
+/// Greedy word wrap at a selected font size.
+fn wrap(font: &FontArc, text: &str, max_w: f32, px: f32) -> Vec<String> {
+    let space_w = advance(font, " ", px);
     let mut lines = Vec::new();
     for para in text.split('\n') {
         let mut cur = String::new();
         let mut cur_w = 0.0f32;
         for word in para.split_whitespace() {
-            let ww = advance(font, word);
+            let ww = advance(font, word, px);
             if cur.is_empty() {
                 if ww <= max_w {
                     cur = word.to_string();
                     cur_w = ww;
                 } else {
-                    let (mut heads, tail, tail_w) = break_word(font, word, max_w);
+                    let (mut heads, tail, tail_w) = break_word(font, word, max_w, px);
                     lines.append(&mut heads);
                     cur = tail;
                     cur_w = tail_w;
@@ -131,7 +165,7 @@ fn wrap(font: &FontArc, text: &str, max_w: f32) -> Vec<String> {
                     cur = word.to_string();
                     cur_w = ww;
                 } else {
-                    let (mut heads, tail, tail_w) = break_word(font, word, max_w);
+                    let (mut heads, tail, tail_w) = break_word(font, word, max_w, px);
                     lines.append(&mut heads);
                     cur = tail;
                     cur_w = tail_w;
@@ -146,12 +180,12 @@ fn wrap(font: &FontArc, text: &str, max_w: f32) -> Vec<String> {
 }
 
 /// Hard-break a single word wider than the text column.
-fn break_word(font: &FontArc, word: &str, max_w: f32) -> (Vec<String>, String, f32) {
+fn break_word(font: &FontArc, word: &str, max_w: f32, px: f32) -> (Vec<String>, String, f32) {
     let mut heads = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0.0f32;
     for c in word.chars() {
-        let cw = advance(font, &c.to_string());
+        let cw = advance(font, &c.to_string(), px);
         if cur_w + cw > max_w && !cur.is_empty() {
             heads.push(std::mem::take(&mut cur));
             cur_w = 0.0;
@@ -166,10 +200,10 @@ fn break_word(font: &FontArc, word: &str, max_w: f32) -> (Vec<String>, String, f
 
 /// Rasterize one line, thin it, trace it, and return strokes in absolute
 /// screen coordinates. `line_y` is the line's typographic top on screen.
-fn trace_line(font: &FontArc, line: &str, line_y: i32) -> Vec<Vec<(i32, i32)>> {
-    let scaled = font.as_scaled(PX);
+fn trace_line(font: &FontArc, line: &str, line_y: i32, px: f32) -> Vec<Vec<(i32, i32)>> {
+    let scaled = font.as_scaled(px);
     let ascent = scaled.ascent();
-    let line_w = advance(font, line);
+    let line_w = advance(font, line, px);
     let mask_w = (line_w.ceil() as i32 + 2 * PAD).max(1);
     let mask_h = ((ascent - scaled.descent()).ceil() as i32 + 2 * PAD).max(1);
     let mut mask = vec![0u8; (mask_w * mask_h) as usize];
@@ -179,7 +213,7 @@ fn trace_line(font: &FontArc, line: &str, line_y: i32) -> Vec<Vec<(i32, i32)>> {
     let baseline = PAD as f32 + ascent;
     for c in line.chars() {
         let id = font.glyph_id(c);
-        let glyph = id.with_scale_and_position(PX, point(pen_x, baseline));
+        let glyph = id.with_scale_and_position(px, point(pen_x, baseline));
         pen_x += scaled.h_advance(id);
         if let Some(outlined) = font.outline_glyph(glyph) {
             let bounds = outlined.px_bounds();
@@ -334,9 +368,9 @@ mod tests {
 
     #[test]
     fn font_loads_and_plans() {
-        let plan = plan_reply("Hello, Tom. It is me.", None, 42).unwrap();
+        let plan = plan_reply("Hello, Tom. It is me.", 42).unwrap();
         assert!(!plan.strokes.is_empty());
-        assert!(plan.total_points > 100);
+        assert!(plan.strokes.iter().map(Vec::len).sum::<usize>() > 100);
         // all strokes inside the screen
         for s in &plan.strokes {
             for &(x, y) in s {
@@ -347,15 +381,20 @@ mod tests {
     }
 
     #[test]
-    fn replan_is_prefix_stable() {
-        // caller contract: sentences are paragraphs, so appending one can
-        // only add lines, never reflow existing ones
-        let a = plan_reply("One sentence here.", None, 7).unwrap();
-        let b = plan_reply("One sentence here.\nAnd another one.", Some(a.block_top), 7).unwrap();
-        assert!(b.strokes.len() > a.strokes.len());
-        for (sa, sb) in a.strokes.iter().zip(b.strokes.iter()) {
-            assert_eq!(sa, sb);
-        }
+    fn long_reply_is_visually_centered_and_fits_the_page() {
+        let text = "The page remembers what people prefer to forget, and it has had a very long time to listen. \
+                    Some truths become clearer in darkness, where there are fewer comforting distractions. \
+                    Write carefully, for even quiet ink may keep more faithfully than you intended.";
+        let plan = plan_reply(text, 7).unwrap();
+        assert!(plan.line_count >= 3);
+        assert!(plan.font_px <= MAX_PX);
+        let (min_x, min_y, max_x, max_y) = stroke_bounds(&plan.strokes).unwrap();
+        assert_eq!(plan.block_top, min_y);
+        let top_space = min_y;
+        let bottom_space = crate::fb::HEIGHT - 1 - max_y;
+        assert!((top_space - bottom_space).abs() <= 1);
+        assert!(min_x >= 0);
+        assert!(max_x < crate::fb::WIDTH);
     }
 
     #[test]
@@ -363,8 +402,11 @@ mod tests {
         let font = FontArc::try_from_slice(FONT_BYTES).unwrap();
         let max_w = (crate::fb::WIDTH - 2 * MARGIN) as f32;
         let long = "word ".repeat(200);
-        for line in wrap(&font, long.trim(), max_w) {
-            assert!(advance(&font, &line) <= max_w + 1.0, "'{line}' too wide");
+        for line in wrap(&font, long.trim(), max_w, MAX_PX) {
+            assert!(
+                advance(&font, &line, MAX_PX) <= max_w + 1.0,
+                "'{line}' too wide"
+            );
         }
     }
 }

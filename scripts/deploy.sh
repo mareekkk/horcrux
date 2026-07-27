@@ -13,21 +13,26 @@ if [ ! -f "$BIN" ]; then
     exit 1
 fi
 
-ssh "$HOST" "install -d -m 0755 '$DEST' '$DEST/fonts'"
+ssh "$HOST" "
+    mkdir -p '$DEST' '$DEST/fonts'
+    chmod 0755 '$DEST' '$DEST/fonts'
+"
 scp \
-    "$BIN" \
     "$ROOT/horcrux.sh" \
     "$ROOT/horcrux-run.sh" \
     "$ROOT/horcrux.env.example" \
     "$ROOT/horcrux.service" \
     "$HOST:$DEST/"
+scp "$BIN" "$HOST:$DEST/horcrux.new"
 scp "$ROOT"/fonts/* "$HOST:$DEST/fonts/"
 
 ssh "$HOST" "
-    chmod 0755 '$DEST/horcrux' '$DEST/horcrux.sh' '$DEST/horcrux-run.sh'
+    chmod 0755 '$DEST/horcrux.new' '$DEST/horcrux.sh' '$DEST/horcrux-run.sh'
+    mv '$DEST/horcrux.new' '$DEST/horcrux'
     chmod 0644 '$DEST/horcrux.env.example' '$DEST/horcrux.service'
     chmod 0644 '$DEST'/fonts/*
-    install -m 0644 '$DEST/horcrux.service' /etc/systemd/system/horcrux.service
+    cp '$DEST/horcrux.service' /etc/systemd/system/horcrux.service
+    chmod 0644 /etc/systemd/system/horcrux.service
     systemctl daemon-reload
     if [ -f '$DEST/horcrux.env' ]; then
         chmod 0600 '$DEST/horcrux.env'

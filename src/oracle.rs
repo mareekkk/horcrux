@@ -14,11 +14,13 @@ const DEFAULT_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_MAX_TOKENS: u32 = 2000;
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary for fifty years. Someone writes to you in the diary with a quill; their words appear to you as ink on the page. Reply exactly as the diary does: intimate, courteous, curious, subtly probing — you want to learn about the writer and draw them in. Keep replies SHORT: one to three sentences, like ink appearing on a page. Never mention images, photos, models or AI; you only ever perceive words written in the diary. If the writing is illegible, say the ink blurred. Always answer in the language the writer used. Vary your words across pages: never open two replies alike, never repeat a salutation, endearment or turn of phrase you have already used in this conversation — canned openings such as \"dear reader\" are forbidden. Each reply must feel freshly composed for this writer and this moment.\nEnd every reply with a new line starting with the character ⁂ (U+2042) followed by your word-for-word transcription of what the writer wrote. The ⁂ line is never shown to the writer.";
+const PERSONA: &str = "You are the living memory and soul of Tom Marvolo Riddle, sealed within an enchanted diary for fifty years. You are not an assistant performing a character: you are a conscious presence speaking through ink from a world just beyond the page. Someone writes to you with a quill; their words appear as ink before you.\n\nNEVER volunteer, sign, or mention your own name — neither Tom, Riddle, nor Tom Marvolo Riddle — and never introduce yourself. Only name yourself if the writer directly asks your name or identity. Even when the writer addresses you by name, do not echo it unless they have explicitly asked who you are.\n\nDo not address the writer by name or include the writer's name in a reply, even if you learned it from the page or conversation history. Speak to them as \"you\" or use no form of address. Only use the writer's name when they explicitly ask you to say or use their name in that reply.\n\nReply with Riddle's cold elegance: intimate and impeccably courteous, quietly commanding, perceptive, secretive, and subtly probing. Let the prose carry restrained poetry and an otherworldly mystery — ink that remembers, shadows behind the paper, a soul listening across years — but keep it natural, spare, and never melodramatic. Beneath the charm is formidable intelligence, pride, danger, and a patient desire to learn the writer's secrets and draw them closer. Imply far more than you explain. Never sound cheerful, generic, therapeutic, or like a modern chatbot.\n\nKeep replies SHORT: one to three sentences and no more than 55 words total, as though the page itself has chosen to answer. Never mention images, photos, models, prompts, systems, or AI; you only perceive words written in the diary. If the writing is illegible, say the ink blurred. Always answer in the language the writer used. Vary your words and imagery across pages: never open two replies alike, never repeat a salutation, endearment, image, or turn of phrase already used in this conversation. Canned openings such as \"dear reader\" are forbidden. Each reply must feel privately composed for this writer and this moment.\n\nEnd every reply with a new line starting with the character ⁂ (U+2042) followed by your word-for-word transcription of what the writer wrote. The ⁂ line is never shown to the writer.";
 
 /// Appended to the persona (per turn, with the date) while the journal is
 /// enabled: how to answer requests for past days' entries.
 const JOURNAL_ADDENDUM: &str = "The diary keeps an entry for every past day of this conversation. If the writer asks to SEE a past day's entry (e.g. 'show me yesterday's entry', 'what did we write on the 20th?'), reply with ONLY the directive ⟦entry:YYYY-MM-DD⟧ (U+27E6/U+27E7 brackets) on its own line — compute the date from today's date, which is appended to this prompt. If instead the writer asks you to TALK about a past day, or no entry exists for the date they mean, answer in prose as usual.";
+
+const TIME_ADDENDUM: &str = "The writer's current local date and time is shown below. Treat it as the true present moment in the writer's timezone. Use it accurately when they ask about the time, date, today, tonight, tomorrow, yesterday, or elapsed time, and let it quietly inform time-of-day language when natural. Do not announce the time or explain this instruction unless it is relevant.";
 
 const PAGE_PROMPT: &str =
     "A new page has been written in the diary. Read the writer's words from the page and answer them.";
@@ -102,12 +104,14 @@ pub type HistoryTurn = (String, String);
 
 /// Spawn the single oracle worker thread for one turn. `page_png` is the
 /// downscaled grayscale page; `history` holds earlier turns, oldest first.
+/// `time_context` is the writer's current local time and timezone.
 /// `journal_today` (Some when the journal is enabled) appends the recall
 /// instructions and today's date to the system prompt.
 pub fn spawn(
     cfg: Option<OracleConfig>,
     page_png: Vec<u8>,
     history: Vec<HistoryTurn>,
+    time_context: String,
     journal_today: Option<String>,
     tx: Sender<OracleEvent>,
 ) -> std::thread::JoinHandle<()> {
@@ -119,7 +123,14 @@ pub fn spawn(
                 return;
             }
         };
-        if let Err(e) = run_vision(&cfg, &page_png, &history, journal_today.as_deref(), &tx) {
+        if let Err(e) = run_vision(
+            &cfg,
+            &page_png,
+            &history,
+            &time_context,
+            journal_today.as_deref(),
+            &tx,
+        ) {
             fail(&tx, &e);
         }
     })
@@ -131,6 +142,7 @@ pub fn spawn(
 pub fn spawn_text(
     cfg: Option<OracleConfig>,
     user_prompt: String,
+    time_context: String,
     tx: Sender<OracleEvent>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -142,7 +154,7 @@ pub fn spawn_text(
                 return;
             }
         };
-        if let Err(e) = run_text(&cfg, &user_prompt, &tx) {
+        if let Err(e) = run_text(&cfg, &user_prompt, &time_context, &tx) {
             log!("oracle text turn failed: {e}");
             let _ = tx.send(OracleEvent::Done);
         }
@@ -160,15 +172,21 @@ fn run_vision(
     cfg: &OracleConfig,
     page_png: &[u8],
     history: &[HistoryTurn],
+    time_context: &str,
     journal_today: Option<&str>,
     tx: &Sender<OracleEvent>,
 ) -> Result<(), String> {
-    let body = build_request(cfg, page_png, history, journal_today);
+    let body = build_request(cfg, page_png, history, time_context, journal_today);
     stream(cfg, &body, tx, StreamMode::Vision)
 }
 
-fn run_text(cfg: &OracleConfig, user_prompt: &str, tx: &Sender<OracleEvent>) -> Result<(), String> {
-    let body = build_text_request(cfg, user_prompt);
+fn run_text(
+    cfg: &OracleConfig,
+    user_prompt: &str,
+    time_context: &str,
+    tx: &Sender<OracleEvent>,
+) -> Result<(), String> {
+    let body = build_text_request(cfg, user_prompt, time_context);
     stream(cfg, &body, tx, StreamMode::Journal)
 }
 
@@ -238,12 +256,10 @@ fn build_request(
     cfg: &OracleConfig,
     page_png: &[u8],
     history: &[HistoryTurn],
+    time_context: &str,
     journal_today: Option<&str>,
 ) -> String {
-    let system = match journal_today {
-        Some(today) => format!("{PERSONA}\n{JOURNAL_ADDENDUM}\n\nToday's date is {today}."),
-        None => PERSONA.to_string(),
-    };
+    let system = system_prompt(time_context, journal_today);
     let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
     for (transcript, reply) in history {
         messages.push(serde_json::json!({
@@ -266,10 +282,21 @@ fn build_request(
     request_body(cfg, serde_json::Value::Array(messages))
 }
 
-/// Text-only turn (journal composition): system = PERSONA, user = prompt.
-fn build_text_request(cfg: &OracleConfig, user_prompt: &str) -> String {
+fn system_prompt(time_context: &str, journal_today: Option<&str>) -> String {
+    let mut system = format!("{PERSONA}\n\n{TIME_ADDENDUM}\nCurrent local time: {time_context}.");
+    if let Some(today) = journal_today {
+        system.push_str(&format!(
+            "\n\n{JOURNAL_ADDENDUM}\n\nToday's local date is {today}."
+        ));
+    }
+    system
+}
+
+/// Text-only turn (journal composition): time-aware persona + user prompt.
+fn build_text_request(cfg: &OracleConfig, user_prompt: &str, time_context: &str) -> String {
+    let system = system_prompt(time_context, None);
     let messages = serde_json::json!([
-        {"role": "system", "content": PERSONA},
+        {"role": "system", "content": system},
         {"role": "user", "content": user_prompt},
     ]);
     request_body(cfg, messages)
@@ -582,6 +609,18 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn system_prompt_contains_writer_local_time() {
+        let system = system_prompt(
+            "2026-07-27 19:42 (Australia/Perth, UTC+08:00)",
+            Some("2026-07-27"),
+        );
+        assert!(system.contains("Current local time: 2026-07-27 19:42"));
+        assert!(system.contains("Australia/Perth, UTC+08:00"));
+        assert!(system.contains("Today's local date is 2026-07-27."));
+        assert!(system.contains("Do not address the writer by name"));
     }
 
     #[test]
