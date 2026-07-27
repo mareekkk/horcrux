@@ -28,6 +28,9 @@ use std::time::{Duration, Instant};
 use surface::{Rect, Surface};
 
 const PAGE_PNG_PATH: &str = "/tmp/horcrux-page.png";
+const DEFAULT_TZ_NAME: &str = "Australia/Perth";
+const DEFAULT_TZ_OFFSET_HOURS: i32 = 8;
+const DEFAULT_LIBRARY_DIR: &str = "/home/root/.local/share/remarkable/xochitl";
 
 const LOOP_MS: u64 = 2;
 const INK_FLUSH_MS: u64 = 15;
@@ -37,11 +40,10 @@ const DRINK_STAGES: u8 = 26;
 
 /// Delay between a reply segment's speckle pass and its solidify pass.
 const SOLIDIFY_MS: u64 = 120;
-const REPLY_BRUSH_R: i32 = 2;
-
-const LINGER_BASE_MS: u64 = 0;
-const LINGER_PER_POINT_MS: u64 = 1;
-const LINGER_CAP_MS: u64 = 20_000;
+/// A one-pixel radius keeps the handwriting delicate rather than heavy.
+const REPLY_BRUSH_R: i32 = 1;
+/// Time a completed ordinary reply remains still before it starts fading.
+const REPLY_LINGER_MS: u64 = 4_000;
 
 const FADE_STAGES: u8 = 26;
 
@@ -137,9 +139,24 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "horcrux {}\n\nTom's Diary for the reMarkable 2\n\nOptions:\n  -h, --help       Show this help\n  -V, --version    Show the version",
+                    "horcrux {}\n\nTom's Diary for the reMarkable 2\n\nOptions:\n  -h, --help          Show this help\n  -V, --version       Show the version\n      --publish-diary Rebuild the Markdown diary and stock-library EPUB",
                     env!("CARGO_PKG_VERSION")
                 );
+                return;
+            }
+            "--publish-diary" => {
+                let memory = Memory::from_env();
+                let journal_dir = configured_journal_dir(&memory);
+                let library_dir = configured_library_dir();
+                let time_context =
+                    journal::current_time_context(&configured_tz_name(), configured_tz_offset());
+                match journal::publish_diary(&journal_dir, &library_dir, &time_context) {
+                    Ok(path) => println!("published {}", path.display()),
+                    Err(error) => {
+                        eprintln!("horcrux: diary publish failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
                 return;
             }
             _ => {}
@@ -196,8 +213,10 @@ struct App {
 
     // journal configuration
     journal_enabled: bool,
+    tz_name: String,
     tz_offset_hours: i32,
     journal_dir: PathBuf,
+    library_dir: PathBuf,
 
     // live ink (Listening)
     ink: Ink,
@@ -246,11 +265,7 @@ struct Conjure {
 impl App {
     fn new(surf: Surface, input: Input, memory: Memory, oracle_cfg: Option<OracleConfig>) -> App {
         let now = Instant::now();
-        let journal_dir = std::env::var("HORCRUX_JOURNAL_DIR")
-            .ok()
-            .filter(|path| !path.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| journal::journal_dir(memory.dir()));
+        let journal_dir = configured_journal_dir(&memory);
         App {
             surf,
             input,
@@ -261,11 +276,10 @@ impl App {
             journal_enabled: std::env::var("HORCRUX_JOURNAL")
                 .map(|v| v != "off")
                 .unwrap_or(true),
-            tz_offset_hours: std::env::var("HORCRUX_TZ_OFFSET")
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0),
+            tz_name: configured_tz_name(),
+            tz_offset_hours: configured_tz_offset(),
             journal_dir,
+            library_dir: configured_library_dir(),
             ink: Ink::new(),
             pen_down: false,
             last_pt: None,
@@ -369,15 +383,12 @@ impl App {
             return false;
         }
         let today = journal::today_ymd(self.tz_offset_hours);
-        if journal::entry_path(&self.journal_dir, &today).exists() {
-            return false;
-        }
         let pages = self.memory.pages_on(&today, self.tz_offset_hours);
         if pages.is_empty() {
             return false;
         }
         log!(
-            "composing journal entry for {today} ({} pages)",
+            "composing updated journal entry for {today} ({} pages)",
             pages.len()
         );
         let prompt = journal::build_journal_prompt(&pages, &today);
@@ -398,7 +409,8 @@ impl App {
             .wrapping_add(1013904223);
         let (tx, rx) = std::sync::mpsc::channel();
         self.rx = Some(rx);
-        oracle::spawn_text(self.oracle_cfg.clone(), prompt, tx);
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        oracle::spawn_text(self.oracle_cfg.clone(), prompt, time_context, tx);
         self.surf.full_white_refresh();
         self.state = State::Journaling {
             next: Instant::now(),
@@ -504,10 +516,12 @@ impl App {
         let journal_today = self
             .journal_enabled
             .then(|| journal::today_ymd(self.tz_offset_hours));
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
         oracle::spawn(
             self.oracle_cfg.clone(),
             png,
             self.memory.history(),
+            time_context,
             journal_today,
             tx,
         );
@@ -770,7 +784,19 @@ impl App {
                 .map(|p| p.strokes.clone())
                 .unwrap_or_default();
             match journal::save_entry(&self.journal_dir, &today, &text, &strokes) {
-                Ok(()) => log!("journal entry saved for {today}"),
+                Ok(()) => {
+                    log!("journal entry saved for {today}");
+                    let time_context =
+                        journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+                    match journal::publish_diary(
+                        &self.journal_dir,
+                        &self.library_dir,
+                        &time_context,
+                    ) {
+                        Ok(path) => log!("stock-library diary refreshed from {}", path.display()),
+                        Err(error) => log!("stock-library diary refresh failed: {error}"),
+                    }
+                }
                 Err(e) => log!("journal save failed: {e}"),
             }
         }
@@ -833,11 +859,9 @@ impl App {
     }
 
     fn enter_lingering(&mut self) {
-        let points = self.plan.as_ref().map(|p| p.total_points).unwrap_or(0) as u64;
-        let dur = (LINGER_BASE_MS + LINGER_PER_POINT_MS * points).min(LINGER_CAP_MS);
-        log!("turn complete, lingering {}ms", dur);
+        log!("turn complete, lingering {}ms", REPLY_LINGER_MS);
         self.state = State::Lingering {
-            until: Instant::now() + Duration::from_millis(dur),
+            until: Instant::now() + Duration::from_millis(REPLY_LINGER_MS),
         };
         self.save_turn();
     }
@@ -867,7 +891,7 @@ impl App {
                 p.strokes
                     .iter()
                     .flatten()
-                    .map(|&(x, y)| (x, y, 2))
+                    .map(|&(x, y)| (x, y, REPLY_BRUSH_R))
                     .collect()
             })
             .unwrap_or_default();
@@ -999,6 +1023,37 @@ impl App {
             }
         }
     }
+}
+
+fn configured_journal_dir(memory: &Memory) -> PathBuf {
+    std::env::var("HORCRUX_JOURNAL_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| journal::journal_dir(memory.dir()))
+}
+
+fn configured_library_dir() -> PathBuf {
+    std::env::var("HORCRUX_LIBRARY_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LIBRARY_DIR))
+}
+
+fn configured_tz_name() -> String {
+    std::env::var("HORCRUX_TZ_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_TZ_NAME.to_string())
+}
+
+fn configured_tz_offset() -> i32 {
+    std::env::var("HORCRUX_TZ_OFFSET")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|offset| (-23..=23).contains(offset))
+        .unwrap_or(DEFAULT_TZ_OFFSET_HOURS)
 }
 
 fn cleanup_page_png() {

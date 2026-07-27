@@ -23,10 +23,11 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "Hello, Tom. I found your diary.\nWho are you, really?".to_string());
     let plan = script::plan_reply(&text, None, 0x5EED).expect("plan failed");
+    let point_count: usize = plan.strokes.iter().map(Vec::len).sum();
     println!(
         "{} strokes, {} points, block_top {}",
         plan.strokes.len(),
-        plan.total_points,
+        point_count,
         plan.block_top
     );
 
@@ -53,11 +54,11 @@ fn main() {
                     stamp(
                         (lx as f32 + (x - lx) as f32 * t).round() as i32,
                         (ly as f32 + (y - ly) as f32 * t).round() as i32,
-                        2,
+                        1,
                     );
                 }
             } else {
-                stamp(x, y, 2);
+                stamp(x, y, 1);
             }
             prev = Some((x, y));
         }

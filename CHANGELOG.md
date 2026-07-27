@@ -7,6 +7,36 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-27
+
+### Added
+
+- Writer-local date and time context on every ordinary reply and journal turn,
+  configurable through timezone name and UTC offset settings.
+- A cumulative `Horcrux Diary.md` rebuilt from dated summaries whenever a
+  session ends.
+- A matching, automatically refreshed EPUB registered as **Horcrux Diary** in
+  the stock reMarkable My Files interface.
+- `horcrux --publish-diary` for rebuilding the Markdown and library document
+  without starting the display application.
+
+### Changed
+
+- Refined the diary voice toward restrained, poetic, otherworldly mystery.
+- Prevented replies from addressing the writer by name unless the writer
+  explicitly asks for their name to be used in that reply.
+- Prevented the diary from volunteering its own identity unless directly
+  asked.
+- Reduced reply brush weight and set completed replies to linger for four
+  seconds before fading.
+- Regenerated the current day's summary at every session end so it incorporates
+  all newly written pages rather than keeping the first summary of the day.
+
+### Fixed
+
+- Made deployment compatible with the tablet's BusyBox userspace, which does
+  not provide the GNU `install` command.
+
 ## [0.1.0] - 2026-07-27
 
 ### Added
@@ -28,5 +58,6 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Version reporting through `horcrux --version` and versioned startup logs.
 - Reproducible ARMv7 cross-build and release packaging scripts.
 
-[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mareekkk/horcrux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mareekkk/horcrux/releases/tag/v0.1.0

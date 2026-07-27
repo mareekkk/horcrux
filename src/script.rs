@@ -52,7 +52,6 @@ pub struct ReplyPlan {
     /// sorted by minimum x (left-to-right). Absolute screen coordinates.
     pub strokes: Vec<Vec<(i32, i32)>>,
     pub block_top: i32,
-    pub total_points: usize,
 }
 
 /// Plan the handwriting for `text`. Pass the `block_top` of an earlier plan
@@ -86,11 +85,9 @@ pub fn plan_reply(text: &str, block_top: Option<i32>, seed: u64) -> Option<Reply
     if strokes.is_empty() {
         return None;
     }
-    let total_points = strokes.iter().map(|s| s.len()).sum();
     Some(ReplyPlan {
         strokes,
         block_top: top,
-        total_points,
     })
 }
 
@@ -336,7 +333,7 @@ mod tests {
     fn font_loads_and_plans() {
         let plan = plan_reply("Hello, Tom. It is me.", None, 42).unwrap();
         assert!(!plan.strokes.is_empty());
-        assert!(plan.total_points > 100);
+        assert!(plan.strokes.iter().map(Vec::len).sum::<usize>() > 100);
         // all strokes inside the screen
         for s in &plan.strokes {
             for &(x, y) in s {

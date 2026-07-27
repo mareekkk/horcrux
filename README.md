@@ -237,7 +237,9 @@ the diary only when selected.
 | `HORCRUX_MEMORY_TURNS` | `6` | Recent turns supplied as conversational context |
 | `HORCRUX_JOURNAL` | `on` | `off` disables daily entries and recall |
 | `HORCRUX_JOURNAL_DIR` | beside memory, under `journal/` | Daily text and stroke storage |
-| `HORCRUX_TZ_OFFSET` | `0` | Whole hours added to UTC for journal dates |
+| `HORCRUX_LIBRARY_DIR` | reMarkable xochitl library | Destination for the readable diary EPUB |
+| `HORCRUX_TZ_NAME` | `Australia/Perth` | Writer timezone name supplied to the oracle |
+| `HORCRUX_TZ_OFFSET` | `8` | Whole hours added to UTC for the writer's local clock |
 
 Animation values are deliberately bounded so an accidental zero or extreme
 value cannot lock the display loop. Invalid values are ignored and the default
@@ -252,13 +254,18 @@ and detailed descriptions of every variable.
 │   ├── index.tsv
 │   └── <timestamp>.strokes
 └── journal/
+    ├── Horcrux Diary.md
     ├── YYYY-MM-DD.txt
     └── YYYY-MM-DD.strokes
 ```
 
 Memory is capped at the 400 most recent conversational pages. The daily entry
 uses every page from the selected day that remains in that retained history.
-Journal entries do not feed back into conversation memory.
+At every session end, the current day's summary is regenerated so it includes
+the latest pages, and the cumulative Markdown diary is rebuilt. Because the
+stock reMarkable interface does not open Markdown, Horcrux also refreshes a
+matching **Horcrux Diary** EPUB in My Files. Journal entries do not feed back
+into conversation memory.
 
 ## How the spell is made
 
