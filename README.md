@@ -43,9 +43,10 @@ absorbing it.
 ### An unseen hand answers
 
 The written page is rasterized and sent to an OpenAI-compatible vision model.
-The reply is set in a script font, reduced to single-stroke paths, and replayed
-from left to right. It is not displayed as a block of text: it writes itself
-onto the page.
+The complete reply is fitted from near the top of the page, set in the largest
+script size that keeps every wrapped line visible, reduced to single-stroke
+paths, and replayed from left to right. It is not displayed as a block of text:
+it writes itself onto the page.
 
 ### The diary remembers
 

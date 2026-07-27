@@ -53,6 +53,9 @@ const JOURNAL_LINGER_MS: u64 = 2000;
 const CONJURE_TICK_MS: u64 = 10;
 const CONJURE_POINTS_PER_TICK: usize = 48;
 const CONJURE_LINGER_MS: u64 = 2500;
+const MAX_REPLY_SENTENCES: usize = 3;
+const MAX_REPLY_WORDS: usize = 55;
+const MAX_REPLY_CHARS: usize = 420;
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -101,9 +104,11 @@ enum State {
         stage: u8,
         next: Instant,
     },
-    /// Waiting on the oracle's first sentence; the page stays blank (no
+    /// Waiting on the oracle's complete reply; the page stays blank (no
     /// blinking indicator — it read as a defect on the e-ink panel).
     Thinking,
+    /// Waiting for the complete journal entry before fitting it to the page.
+    JournalThinking,
     Replying {
         next: Instant,
     },
@@ -342,7 +347,9 @@ impl App {
                 // a second quit during journal composition skips the entry
                 if matches!(
                     self.state,
-                    State::Journaling { .. } | State::JournalLingering { .. }
+                    State::JournalThinking
+                        | State::Journaling { .. }
+                        | State::JournalLingering { .. }
                 ) {
                     log!("quit during journaling — skipping the entry");
                     return true;
@@ -412,9 +419,7 @@ impl App {
         let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
         oracle::spawn_text(self.oracle_cfg.clone(), prompt, time_context, tx);
         self.surf.full_white_refresh();
-        self.state = State::Journaling {
-            next: Instant::now(),
-        };
+        self.state = State::JournalThinking;
         true
     }
 
@@ -545,12 +550,10 @@ impl App {
                 events.push(ev);
             }
         }
-        let mut got_ink = false;
         for ev in events {
             match ev {
                 OracleEvent::Ink(s) => {
                     self.reply_sentences.push(s);
-                    got_ink = true;
                 }
                 OracleEvent::Transcript(t) => {
                     self.transcript = t;
@@ -567,14 +570,6 @@ impl App {
                 }
             }
         }
-        if got_ink
-            && matches!(
-                self.state,
-                State::Thinking | State::Replying { .. } | State::Journaling { .. }
-            )
-        {
-            self.replan();
-        }
     }
 
     fn begin_reply(&mut self) {
@@ -590,6 +585,7 @@ impl App {
             self.state = State::Listening;
             return;
         }
+        constrain_reply(&mut self.reply_sentences);
         self.replan();
         self.state = State::Replying {
             next: Instant::now(),
@@ -640,19 +636,23 @@ impl App {
         }
     }
 
-    /// (Re)plan the handwriting for the full reply text. Greedy wrap keeps
-    /// earlier lines stable, so already-drawn strokes are an exact prefix.
+    /// Plan the complete reply after streaming ends, allowing the handwriting
+    /// fitter to choose a top-aligned font size that keeps every line visible.
     fn replan(&mut self) {
         if self.reply_sentences.is_empty() {
             return;
         }
-        // Each sentence is its own paragraph, so a newly arrived sentence
-        // always starts a fresh line: earlier lines (and their strokes)
-        // never change, keeping the plan prefix-stable.
-        let plan_text = self.reply_sentences.join("\n");
-        let block_top = self.plan.as_ref().map(|p| p.block_top);
-        match script::plan_reply(&plan_text, block_top, self.turn_seed) {
-            Some(plan) => self.plan = Some(plan),
+        let plan_text = self.reply_sentences.join(" ");
+        match script::plan_reply(&plan_text, self.turn_seed) {
+            Some(plan) => {
+                log!(
+                    "reply layout: {} lines at {:.0}px, top {}",
+                    plan.line_count,
+                    plan.font_px,
+                    plan.block_top
+                );
+                self.plan = Some(plan);
+            }
             None => log!("handwriting plan failed"),
         }
     }
@@ -951,7 +951,7 @@ impl App {
                     self.ink.clear();
                     self.dissolve = None;
                     self.drain_oracle();
-                    if !self.reply_sentences.is_empty() || self.oracle_done {
+                    if self.oracle_done {
                         self.begin_reply();
                     } else {
                         self.state = State::Thinking;
@@ -965,12 +965,11 @@ impl App {
             }
             State::Thinking => {
                 self.drain_oracle();
-                if !self.reply_sentences.is_empty() || self.oracle_done {
+                if self.oracle_done {
                     self.begin_reply();
                 }
             }
             State::Replying { next } => {
-                self.drain_oracle();
                 if now >= next {
                     self.replay_tick(false);
                 }
@@ -980,8 +979,21 @@ impl App {
                     self.start_fading();
                 }
             }
-            State::Journaling { next } => {
+            State::JournalThinking => {
                 self.drain_oracle();
+                if self.oracle_done {
+                    if self.reply_sentences.is_empty() {
+                        log!("journal oracle returned no ink");
+                        self.want_quit = true;
+                    } else {
+                        self.replan();
+                        self.state = State::Journaling {
+                            next: Instant::now(),
+                        };
+                    }
+                }
+            }
+            State::Journaling { next } => {
                 if now >= next {
                     self.replay_tick(true);
                 }
@@ -1056,8 +1068,81 @@ fn configured_tz_offset() -> i32 {
         .unwrap_or(DEFAULT_TZ_OFFSET_HOURS)
 }
 
+/// Enforce the ordinary-reply contract even if the model ignores it. The
+/// planner still scales to fit, but this keeps handwriting legible rather than
+/// shrinking an unexpectedly huge response to a speck.
+fn constrain_reply(sentences: &mut Vec<String>) {
+    let original_sentence_count = sentences.len();
+    sentences.truncate(MAX_REPLY_SENTENCES);
+    let joined = sentences.join(" ");
+    let words: Vec<&str> = joined.split_whitespace().collect();
+    let mut constrained = words
+        .iter()
+        .take(MAX_REPLY_WORDS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut truncated =
+        original_sentence_count > MAX_REPLY_SENTENCES || words.len() > MAX_REPLY_WORDS;
+    if constrained.chars().count() > MAX_REPLY_CHARS {
+        constrained = constrained.chars().take(MAX_REPLY_CHARS).collect();
+        constrained = constrained.trim_end().to_string();
+        truncated = true;
+    }
+    if truncated {
+        constrained = constrained
+            .trim_end_matches(['.', '!', '?', '…'])
+            .trim_end()
+            .to_string();
+        constrained.push('…');
+        log!(
+            "reply constrained to {} words / {} characters",
+            constrained.split_whitespace().count(),
+            constrained.chars().count()
+        );
+    }
+    sentences.clear();
+    if !constrained.is_empty() {
+        sentences.push(constrained);
+    }
+}
+
 fn cleanup_page_png() {
     if std::path::Path::new(PAGE_PNG_PATH).exists() {
         let _ = std::fs::remove_file(PAGE_PNG_PATH);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_reply_is_bounded_even_when_model_overruns() {
+        let mut sentences = vec![
+            (0..30)
+                .map(|i| format!("first{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..30)
+                .map(|i| format!("second{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            "Third sentence.".to_string(),
+            "A forbidden fourth sentence.".to_string(),
+        ];
+        constrain_reply(&mut sentences);
+        assert_eq!(sentences.len(), 1);
+        assert!(sentences[0].split_whitespace().count() <= MAX_REPLY_WORDS);
+        assert!(sentences[0].chars().count() <= MAX_REPLY_CHARS + 1);
+        assert!(sentences[0].ends_with('…'));
+        assert!(!sentences[0].contains("forbidden fourth"));
+    }
+
+    #[test]
+    fn short_reply_is_unchanged_except_for_sentence_spacing() {
+        let mut sentences = vec!["One answer.".to_string(), "Another answer.".to_string()];
+        constrain_reply(&mut sentences);
+        assert_eq!(sentences, vec!["One answer. Another answer."]);
     }
 }

@@ -22,13 +22,15 @@ fn main() {
     let text = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "Hello, Tom. I found your diary.\nWho are you, really?".to_string());
-    let plan = script::plan_reply(&text, None, 0x5EED).expect("plan failed");
+    let plan = script::plan_reply(&text, 0x5EED).expect("plan failed");
     let point_count: usize = plan.strokes.iter().map(Vec::len).sum();
     println!(
-        "{} strokes, {} points, block_top {}",
+        "{} strokes, {} points, block_top {}, {} lines at {:.0}px",
         plan.strokes.len(),
         point_count,
-        plan.block_top
+        plan.block_top,
+        plan.line_count,
+        plan.font_px
     );
 
     let (w, h) = (fb::WIDTH as usize, fb::HEIGHT as usize);

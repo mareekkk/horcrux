@@ -34,6 +34,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Prevented long three-sentence replies from starting too low and disappearing
+  below the screen: writing now waits for the complete response, starts near
+  the top, and automatically selects the largest font size that fits.
+- Added a 55-word hard limit for ordinary replies when a model ignores the
+  prompt's response-length instruction.
 - Made deployment compatible with the tablet's BusyBox userspace, which does
   not provide the GNU `install` command.
 
