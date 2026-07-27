@@ -637,7 +637,8 @@ impl App {
     }
 
     /// Plan the complete reply after streaming ends, allowing the handwriting
-    /// fitter to choose a top-aligned font size that keeps every line visible.
+    /// fitter to choose a font size and center the complete ink block while
+    /// keeping every line visible.
     fn replan(&mut self) {
         if self.reply_sentences.is_empty() {
             return;

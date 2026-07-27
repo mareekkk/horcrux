@@ -36,7 +36,7 @@ pub const MAX_PX: f32 = 86.0;
 const MIN_PX: i32 = 18;
 /// Left/right page margins.
 const MARGIN: i32 = 100;
-/// Replies always begin near the top and remain above the bottom edge.
+/// Minimum vertical breathing room used while selecting a fitting font size.
 const TOP_MARGIN: i32 = 72;
 const BOTTOM_MARGIN: i32 = 72;
 /// Padding around each line mask so swashes can overflow the advance box.
@@ -77,21 +77,55 @@ pub fn plan_reply(text: &str, seed: u64) -> Option<ReplyPlan> {
         let jitter = ((rng >> 16) % 7) as i32 - 3;
         let line_y = TOP_MARGIN + i as i32 * line_h + jitter;
         let mut line_strokes = trace_line(&font, line, line_y, px);
+        center_strokes_x(&mut line_strokes);
         line_strokes.sort_by_key(|s| s.iter().map(|p| p.0).min().unwrap_or(0));
         strokes.extend(line_strokes);
     }
     if strokes.is_empty() {
         return None;
     }
+    let (_, min_y, _, max_y) = stroke_bounds(&strokes)?;
+    let ink_h = max_y - min_y + 1;
+    let centered_top = (crate::fb::HEIGHT - ink_h) / 2;
+    let dy = centered_top - min_y;
+    for stroke in &mut strokes {
+        for (_, y) in stroke {
+            *y += dy;
+        }
+    }
     Some(ReplyPlan {
         strokes,
-        block_top: TOP_MARGIN,
+        block_top: centered_top,
         font_px: px,
         line_count: lines.len(),
     })
 }
 
 // --- layout ------------------------------------------------------------------
+
+fn center_strokes_x(strokes: &mut [Vec<(i32, i32)>]) {
+    let Some((min_x, _, max_x, _)) = stroke_bounds(strokes) else {
+        return;
+    };
+    let ink_w = max_x - min_x + 1;
+    let dx = (crate::fb::WIDTH - ink_w) / 2 - min_x;
+    for stroke in strokes {
+        for (x, _) in stroke {
+            *x += dx;
+        }
+    }
+}
+
+fn stroke_bounds(strokes: &[Vec<(i32, i32)>]) -> Option<(i32, i32, i32, i32)> {
+    let mut points = strokes.iter().flatten();
+    let &(first_x, first_y) = points.next()?;
+    Some(points.fold(
+        (first_x, first_y, first_x, first_y),
+        |(min_x, min_y, max_x, max_y), &(x, y)| {
+            (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+        },
+    ))
+}
 
 fn line_height(px: f32) -> i32 {
     (px * 1.26).ceil() as i32
@@ -347,19 +381,20 @@ mod tests {
     }
 
     #[test]
-    fn long_reply_starts_high_and_fits_the_page() {
+    fn long_reply_is_visually_centered_and_fits_the_page() {
         let text = "The page remembers what people prefer to forget, and it has had a very long time to listen. \
                     Some truths become clearer in darkness, where there are fewer comforting distractions. \
                     Write carefully, for even quiet ink may keep more faithfully than you intended.";
         let plan = plan_reply(text, 7).unwrap();
-        assert_eq!(plan.block_top, TOP_MARGIN);
         assert!(plan.line_count >= 3);
         assert!(plan.font_px <= MAX_PX);
-        for stroke in &plan.strokes {
-            for &(_, y) in stroke {
-                assert!(y < crate::fb::HEIGHT - 20, "reply overflowed at y={y}");
-            }
-        }
+        let (min_x, min_y, max_x, max_y) = stroke_bounds(&plan.strokes).unwrap();
+        assert_eq!(plan.block_top, min_y);
+        let top_space = min_y;
+        let bottom_space = crate::fb::HEIGHT - 1 - max_y;
+        assert!((top_space - bottom_space).abs() <= 1);
+        assert!(min_x >= 0);
+        assert!(max_x < crate::fb::WIDTH);
     }
 
     #[test]
