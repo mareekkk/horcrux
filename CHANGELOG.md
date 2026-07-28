@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-28
+
+### Added
+
+- A cover for the **Horcrux Diary** EPUB: ink-on-parchment art rendered at
+  build time — the title in the diary's own handwriting, a quill and inkwell,
+  a hand-drawn frame, and aged paper — so the book shows a proper cover in the
+  reMarkable library instead of a blank thumbnail.
+- `horcrux --render-cover <path>` to render the cover PNG standalone.
+
 ## [0.3.0] - 2026-07-28
 
 ### Added
@@ -99,7 +109,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Version reporting through `horcrux --version` and versioned startup logs.
 - Reproducible ARMv7 cross-build and release packaging scripts.
 
-[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/mareekkk/horcrux/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/mareekkk/horcrux/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mareekkk/horcrux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mareekkk/horcrux/releases/tag/v0.1.0
