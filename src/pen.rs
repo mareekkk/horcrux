@@ -143,6 +143,31 @@ impl Input {
         out
     }
 
+    /// Block until pen/touch input is ready or `timeout` elapses, whichever
+    /// comes first. Returns true when a device signalled readiness (events
+    /// are then available for `poll()` to drain). The fds stay `O_NONBLOCK`,
+    /// so this is what lets the main loop sleep deeply while idle instead of
+    /// busy-polling at 500 Hz — the process truly blocks in the kernel until
+    /// the pen moves or the deadline is due.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        let mut pfds: [libc::pollfd; 2] = [
+            libc::pollfd {
+                fd: self.pen_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: self.touch_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let n = if self.touch_fd >= 0 { 2 } else { 1 };
+        let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), n as libc::nfds_t, ms) };
+        rc > 0
+    }
+
     fn drain_pen(&mut self, out: &mut Vec<InputEvent>) {
         let mut buf = [0u8; 4096];
         loop {

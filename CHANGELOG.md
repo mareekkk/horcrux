@@ -7,6 +7,41 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-28
+
+### Added
+
+- Battery-saving idle scheduler: the main loop blocks on the input devices
+  with a dynamic timeout instead of busy-polling every 2 ms, dropping idle
+  wakeups from ~500/s to ~1/s so the tablet can idle and autosuspend.
+- Wake detection: the diary notices resume from sleep (CLOCK_BOOTTIME against
+  CLOCK_MONOTONIC), repaints the panel, and gates the pen until the oracle is
+  reachable — so nothing written the instant the tablet wakes is lost.
+- Offline lock screen: when the diary is open but the oracle is unreachable, a
+  random inspirational line is shown and stays until the writer double-taps to
+  dismiss it. No "connecting" spinner, and no separate offline notice — the
+  line itself is the signal.
+- Offline writing: with the network away the writer can still write. Pages are
+  held locally, stamped with the moment they were written, and marked by a
+  small feather in the corner of the page.
+- Barging-in reconnect: the instant connectivity returns mid-conversation, the
+  diary replies at once to the last page — apologising for the interruption —
+  and asks whether to address the rest. A yes produces one unified summary of
+  every held page; a no carries on, the pages left safely held.
+- A reachability probe that can never freeze the interface: a hung DNS resolver
+  on a dead network no longer blocks the main loop or stalls shutdown.
+
+### Changed
+
+- The stock-library EPUB is refreshed at session end whenever any entries
+  exist, not only when the current day's composition succeeded.
+
+### Fixed
+
+- Battery drain while the diary sat idle with the page open.
+- A blank or white screen appearing on wake from sleep.
+- Offline-written pages being lost when written before the tablet reconnected.
+
 ## [0.2.0] - 2026-07-27
 
 ### Added
@@ -64,6 +99,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Version reporting through `horcrux --version` and versioned startup logs.
 - Reproducible ARMv7 cross-build and release packaging scripts.
 
-[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mareekkk/horcrux/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mareekkk/horcrux/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mareekkk/horcrux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mareekkk/horcrux/releases/tag/v0.1.0

@@ -6,7 +6,7 @@
 
 use crate::log;
 use std::io::{BufRead, BufReader};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 const DEFAULT_BASE: &str = "https://api.openai.com/v1";
@@ -30,6 +30,24 @@ const FAILURE_REPLY: &str = "The diary cannot reach its oracle. Is the tablet co
 /// Separator starting the hidden transcription line.
 const TRANSCRIPT_MARK: char = '\u{2042}'; // ⁂
 
+// --- offline-reconnect prompts -------------------------------------------------
+
+/// System-prompt addendum for the "barging-in" turn: connectivity just returned
+/// after absence. The oracle replies to the writer's last page, opening with a
+/// brief in-character apology and closing by asking whether to address the
+/// other pages written while it was silent. Never mentions Wi-Fi/networks.
+const BARGIN_ADDENDUM: &str = "You have just returned after a span of silence — the connection across the page was severed and is whole again. Do NOT mention Wi-Fi, networks, signal, being offline, or technology; speak only of returning from absence. The writer's most recent page is shown. Reply to it in your voice, but OPEN with one brief, in-character apology for the abruptness of your return, and CLOSE by asking whether they would like you to now attend to the other pages they wrote in the silence. Keep the whole reply short.";
+
+/// System-prompt addendum for the one-shot summary of several offline pages.
+const SUMMARIZE_ADDENDUM: &str = "These pages were all written to you during a single silence, shown together. Do not reply to them one by one. Acknowledge what runs through them and answer their combined intent in ONE short, unified reply, as though catching up on a conversation you missed.";
+
+/// Appended to the system prompt while a barging-in question is unanswered, so
+/// the writer's yes/no is conveyed through an invisible directive.
+pub const AWAITING_ADDENDUM: &str = "You recently asked the writer whether you should attend to the pages they wrote during your absence. If their reply means YES (they want you to), reply with ONLY the directive \u{27E6}summarize:offline\u{27E7} on its own line and nothing else — the pages will be shown to you next. If they mean no, or change the subject, answer normally.";
+
+/// The directive the oracle emits to request the offline summary.
+const SUMMARIZE_DIRECTIVE: &str = "\u{27E6}summarize:offline\u{27E7}";
+
 #[derive(Debug)]
 pub enum OracleEvent {
     /// One completed reply sentence, to be written on the page.
@@ -38,6 +56,8 @@ pub enum OracleEvent {
     Transcript(String),
     /// The writer asked to see a past day's journal entry (⟦entry:…⟧).
     ShowEntry(String),
+    /// The writer agreed to have their offline pages addressed (⟦summarize:offline⟧).
+    SummarizeOffline,
     /// The stream ended (normally or after a failure reply).
     Done,
 }
@@ -102,6 +122,52 @@ impl OracleConfig {
 /// One remembered earlier turn: (transcription, reply).
 pub type HistoryTurn = (String, String);
 
+/// One reachability check: any HTTP response (even 401/404) means the oracle's
+/// host is reachable; only transport failures (DNS, refused, timeout) mean
+/// "offline".
+fn probe_once(cfg: &OracleConfig, timeout: Duration) -> bool {
+    let url = format!("{}/models", cfg.base.trim_end_matches('/'));
+    match ureq::head(&url)
+        .set("Authorization", &format!("Bearer {}", cfg.key))
+        .timeout(timeout)
+        .call()
+    {
+        Ok(_) => true,
+        Err(ureq::Error::Status(_, _)) => true, // reached the server
+        Err(_) => false,                        // transport error — offline
+    }
+}
+
+/// Bounded blocking probe, used once at cold start. The HTTP+DNS work runs on
+/// a side thread because ureq's `.timeout()` does NOT cover `getaddrinfo` — on
+/// a dead network the resolver can block for tens of seconds and must not
+/// freeze the UI. The whole probe is capped at `timeout` + 500ms; a missed
+/// deadline is treated as offline.
+pub fn endpoint_reachable(cfg: Option<&OracleConfig>, timeout: Duration) -> bool {
+    let Some(cfg) = cfg.cloned() else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe_once(&cfg, timeout));
+    });
+    rx.recv_timeout(timeout + Duration::from_millis(500))
+        .unwrap_or(false)
+}
+
+/// Spawn the probe asynchronously; the result arrives on the returned channel.
+/// Used by the interactive Connecting/Offline states so the main loop can keep
+/// draining the pen while a hung resolver is still grinding. Single-flight:
+/// the caller spawns at most one probe at a time and drains it non-blockingly.
+pub fn spawn_probe(cfg: Option<&OracleConfig>, timeout: Duration) -> Option<Receiver<bool>> {
+    let cfg = cfg.cloned()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(probe_once(&cfg, timeout));
+    });
+    Some(rx)
+}
+
 /// Spawn the single oracle worker thread for one turn. `page_png` is the
 /// downscaled grayscale page; `history` holds earlier turns, oldest first.
 /// `time_context` is the writer's current local time and timezone.
@@ -113,6 +179,7 @@ pub fn spawn(
     history: Vec<HistoryTurn>,
     time_context: String,
     journal_today: Option<String>,
+    extra: Option<&'static str>,
     tx: Sender<OracleEvent>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -123,12 +190,77 @@ pub fn spawn(
                 return;
             }
         };
+        let pngs = [page_png.as_slice()];
         if let Err(e) = run_vision(
             &cfg,
-            &page_png,
+            &pngs,
             &history,
             &time_context,
             journal_today.as_deref(),
+            extra,
+            &tx,
+        ) {
+            fail(&tx, &e);
+        }
+    })
+}
+
+/// Barging-in turn: connectivity just returned. Replies to the writer's last
+/// offline page with an in-character apology and the "attend to the rest?"
+/// question. Single image, no history, no journal context.
+pub fn spawn_barging_in(
+    cfg: Option<OracleConfig>,
+    last_page_png: Vec<u8>,
+    time_context: String,
+    tx: Sender<OracleEvent>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let cfg = match cfg {
+            Some(c) => c,
+            None => {
+                fail(&tx, "missing HORCRUX_OPENAI_KEY");
+                return;
+            }
+        };
+        let pngs = [last_page_png.as_slice()];
+        if let Err(e) = run_vision(
+            &cfg,
+            &pngs,
+            &[],
+            &time_context,
+            None,
+            Some(BARGIN_ADDENDUM),
+            &tx,
+        ) {
+            fail(&tx, &e);
+        }
+    })
+}
+
+/// One-shot summary of every offline page at once (multiple images), answered
+/// as a single unified reply.
+pub fn spawn_summarize(
+    cfg: Option<OracleConfig>,
+    page_pngs: Vec<Vec<u8>>,
+    time_context: String,
+    tx: Sender<OracleEvent>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let cfg = match cfg {
+            Some(c) => c,
+            None => {
+                fail(&tx, "missing HORCRUX_OPENAI_KEY");
+                return;
+            }
+        };
+        let pngs: Vec<&[u8]> = page_pngs.iter().map(Vec::as_slice).collect();
+        if let Err(e) = run_vision(
+            &cfg,
+            &pngs,
+            &[],
+            &time_context,
+            None,
+            Some(SUMMARIZE_ADDENDUM),
             &tx,
         ) {
             fail(&tx, &e);
@@ -170,13 +302,14 @@ fn fail(tx: &Sender<OracleEvent>, why: &str) {
 
 fn run_vision(
     cfg: &OracleConfig,
-    page_png: &[u8],
+    page_pngs: &[&[u8]],
     history: &[HistoryTurn],
     time_context: &str,
     journal_today: Option<&str>,
+    extra: Option<&str>,
     tx: &Sender<OracleEvent>,
 ) -> Result<(), String> {
-    let body = build_request(cfg, page_png, history, time_context, journal_today);
+    let body = build_request(cfg, page_pngs, history, time_context, journal_today, extra);
     stream(cfg, &body, tx, StreamMode::Vision)
 }
 
@@ -254,12 +387,13 @@ fn stream(
 
 fn build_request(
     cfg: &OracleConfig,
-    page_png: &[u8],
+    page_pngs: &[&[u8]],
     history: &[HistoryTurn],
     time_context: &str,
     journal_today: Option<&str>,
+    extra: Option<&str>,
 ) -> String {
-    let system = system_prompt(time_context, journal_today);
+    let system = system_prompt(time_context, journal_today, extra);
     let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
     for (transcript, reply) in history {
         messages.push(serde_json::json!({
@@ -271,30 +405,34 @@ fn build_request(
             "content": reply,
         }));
     }
-    let data_url = format!("data:image/png;base64,{}", base64_encode(page_png));
+    let mut content = vec![serde_json::json!({"type": "text", "text": PAGE_PROMPT})];
+    for png in page_pngs {
+        let data_url = format!("data:image/png;base64,{}", base64_encode(png));
+        content.push(serde_json::json!({"type": "image_url", "image_url": {"url": data_url}}));
+    }
     messages.push(serde_json::json!({
         "role": "user",
-        "content": [
-            {"type": "text", "text": PAGE_PROMPT},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ],
+        "content": content,
     }));
     request_body(cfg, serde_json::Value::Array(messages))
 }
 
-fn system_prompt(time_context: &str, journal_today: Option<&str>) -> String {
+fn system_prompt(time_context: &str, journal_today: Option<&str>, extra: Option<&str>) -> String {
     let mut system = format!("{PERSONA}\n\n{TIME_ADDENDUM}\nCurrent local time: {time_context}.");
     if let Some(today) = journal_today {
         system.push_str(&format!(
             "\n\n{JOURNAL_ADDENDUM}\n\nToday's local date is {today}."
         ));
     }
+    if let Some(addendum) = extra {
+        system.push_str(&format!("\n\n{addendum}"));
+    }
     system
 }
 
 /// Text-only turn (journal composition): time-aware persona + user prompt.
 fn build_text_request(cfg: &OracleConfig, user_prompt: &str, time_context: &str) -> String {
-    let system = system_prompt(time_context, None);
+    let system = system_prompt(time_context, None, None);
     let messages = serde_json::json!([
         {"role": "system", "content": system},
         {"role": "user", "content": user_prompt},
@@ -383,6 +521,7 @@ impl StreamParser {
     fn decide(&mut self) -> Vec<OracleEvent> {
         enum Verdict {
             Wait,
+            Summarize,
             Directive(String, usize),
             Prose,
         }
@@ -391,7 +530,11 @@ impl StreamParser {
                 return Vec::new();
             };
             let trimmed = buf.trim_start();
-            if let Some(after) = trimmed.strip_prefix(DIRECTIVE_PREFIX) {
+            if trimmed.starts_with(SUMMARIZE_DIRECTIVE) {
+                Verdict::Summarize
+            } else if SUMMARIZE_DIRECTIVE.starts_with(trimmed) {
+                Verdict::Wait // could still become the summarize directive
+            } else if let Some(after) = trimmed.strip_prefix(DIRECTIVE_PREFIX) {
                 match after.find('\u{27E7}') {
                     Some(end) => {
                         let date = after[..end].trim();
@@ -406,13 +549,17 @@ impl StreamParser {
                     None => Verdict::Wait, // directive still streaming in
                 }
             } else if DIRECTIVE_PREFIX.starts_with(trimmed) {
-                Verdict::Wait // could still become a directive — hold
+                Verdict::Wait // could still become a recall directive — hold
             } else {
                 Verdict::Prose
             }
         };
         match verdict {
             Verdict::Wait => Vec::new(),
+            Verdict::Summarize => {
+                self.directive = DirectiveState::Directive;
+                vec![OracleEvent::SummarizeOffline]
+            }
             Verdict::Directive(date, dropped) => {
                 self.dropped_prose += dropped;
                 self.directive = DirectiveState::Directive;
@@ -616,6 +763,7 @@ mod tests {
         let system = system_prompt(
             "2026-07-27 19:42 (Australia/Perth, UTC+08:00)",
             Some("2026-07-27"),
+            None,
         );
         assert!(system.contains("Current local time: 2026-07-27 19:42"));
         assert!(system.contains("Australia/Perth, UTC+08:00"));
@@ -725,6 +873,14 @@ mod tests {
         let mut p = StreamParser::new(StreamMode::Journal);
         let evs = collect(&mut p, &["\u{27E6}entry:2026-07-20\u{27E7}"]);
         assert!(evs.iter().all(is_ink));
+    }
+
+    #[test]
+    fn summarize_directive_emitted_across_deltas() {
+        let mut p = StreamParser::new(StreamMode::Vision);
+        let evs = collect(&mut p, &["\u{27E6}sum", "marize:offline", "\u{27E7}"]);
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], OracleEvent::SummarizeOffline));
     }
 
     #[test]

@@ -31,6 +31,8 @@ stock reMarkable interface when closed.
 > **The diary does not merely remember the day. It writes the day down
 > itself.**
 
+➜ For the full tour, see **[Features](docs/FEATURES.md)**.
+
 ## The enchantment
 
 ### The page drinks your ink
