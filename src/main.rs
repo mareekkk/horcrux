@@ -1801,7 +1801,11 @@ mod app_tests {
                 );
             }
             // distinct openings (the persona forbids repeated salutations)
-            let opening = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            let opening = line
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
             assert!(openings.insert(opening), "line {i} repeats an opening");
         }
     }
