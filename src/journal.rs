@@ -353,14 +353,26 @@ fn build_epub(entries: &[(String, String)], time_context: &str) -> Vec<u8> {
     <dc:language>en</dc:language>
     <dc:creator>Horcrux</dc:creator>
     <meta property="dcterms:modified">{modified}</meta>
+    <meta name="cover" content="cover-image"/>
   </metadata>
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="cover-image" href="cover.png" media-type="image/png" properties="cover-image"/>
+    <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
     <item id="diary" href="diary.xhtml" media-type="application/xhtml+xml"/>
   </manifest>
-  <spine><itemref idref="diary"/></spine>
+  <spine>
+    <itemref idref="cover"/>
+    <itemref idref="diary"/>
+  </spine>
 </package>"#
     );
+    let cover_page = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" epub:type="cover">
+<head><title>Cover</title><style>html,body{margin:0;padding:0}img{width:100%;height:100%;object-fit:contain}</style></head>
+<body><img src="cover.png" alt="Horcrux"/></body>
+</html>"#;
     let nav = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
@@ -373,11 +385,14 @@ fn build_epub(entries: &[(String, String)], time_context: &str) -> Vec<u8> {
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
 </container>"#;
+    let cover_png = crate::cover::cover_png();
     zip_store(&[
         ("mimetype", b"application/epub+zip"),
         ("META-INF/container.xml", container),
         ("OEBPS/content.opf", package.as_bytes()),
         ("OEBPS/nav.xhtml", nav.as_bytes()),
+        ("OEBPS/cover.xhtml", cover_page.as_bytes()),
+        ("OEBPS/cover.png", cover_png.as_slice()),
         ("OEBPS/diary.xhtml", diary.as_bytes()),
     ])
 }

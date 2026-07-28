@@ -7,6 +7,7 @@
 //! Single-threaded state machine on a ~2ms loop; the only thread is one
 //! oracle worker per turn, talking back over a channel.
 
+mod cover;
 mod fb;
 mod ink;
 mod journal;
@@ -225,6 +226,19 @@ fn main() {
                     Ok(path) => println!("published {}", path.display()),
                     Err(error) => {
                         eprintln!("horcrux: diary publish failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            "--render-cover" => {
+                let path = std::env::args()
+                    .nth(2)
+                    .unwrap_or_else(|| "cover.png".to_string());
+                match std::fs::write(&path, cover::cover_png()) {
+                    Ok(()) => println!("cover written to {path}"),
+                    Err(e) => {
+                        eprintln!("horcrux: cannot write cover: {e}");
                         std::process::exit(1);
                     }
                 }
