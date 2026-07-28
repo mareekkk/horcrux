@@ -110,14 +110,28 @@ impl Memory {
         reply: &str,
         strokes: &[Vec<Point>],
     ) -> io::Result<()> {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        self.save_turn_at(transcript, reply, strokes, id)
+    }
+
+    /// Like `save_turn` but with an explicit unix-second id, so an offline
+    /// page that is answered later is filed under the moment it was *written*
+    /// rather than the moment it was answered. The idle-commit gap (>= 3.8s)
+    /// keeps these ids distinct from live turns.
+    pub fn save_turn_at(
+        &self,
+        transcript: &str,
+        reply: &str,
+        strokes: &[Vec<Point>],
+        id: i64,
+    ) -> io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
         fs::create_dir_all(&self.dir)?;
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let mut index = fs::OpenOptions::new()
             .create(true)
             .append(true)

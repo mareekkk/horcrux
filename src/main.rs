@@ -23,7 +23,7 @@ use oracle::{OracleConfig, OracleEvent};
 use pen::{Input, InputEvent, PenSample};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use surface::{Rect, Surface};
 
@@ -32,9 +32,65 @@ const DEFAULT_TZ_NAME: &str = "Australia/Perth";
 const DEFAULT_TZ_OFFSET_HOURS: i32 = 8;
 const DEFAULT_LIBRARY_DIR: &str = "/home/root/.local/share/remarkable/xochitl";
 
-const LOOP_MS: u64 = 2;
 const INK_FLUSH_MS: u64 = 15;
 const MIN_PRESSURE: i32 = 40;
+
+// --- idle-aware main loop (battery) ------------------------------------------
+// The loop blocks on the input devices (see Input::wait) instead of
+// busy-polling every 2ms, and only wakes as often as the current state
+// requires. While the page sits empty and idle it wakes ~1x/s instead of
+// 500x/s, so the CPU can idle and the device is free to autosuspend.
+/// Empty idle page: block on input up to this long before re-checking.
+const IDLE_LISTEN_SEC: u64 = 1;
+/// Ink on the page awaiting the idle-commit: check a few times a second.
+const IDLE_PENDING_MS: u64 = 250;
+/// Waiting on the oracle channel (no fd to poll): check this often.
+const ORACLE_POLL_MS: u64 = 50;
+
+// --- wake + connectivity + offline fallback ----------------------------------
+
+/// A suspend longer than this (BOOTTIME minus MONOTONIC delta jump) counts
+/// as a sleep/wake cycle. Normal idle blocking is <= 1s, well under this.
+const WAKE_THRESHOLD_SECS: i64 = 5;
+/// How often to re-probe the oracle endpoint while connecting / offline.
+const PROBE_INTERVAL_SEC: u64 = 3;
+/// Per-probe reachability timeout.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Cold-start reachability probe (short, so an online launch isn't delayed).
+const COLD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Faint corner indicator shown while pages are queued offline.
+const FEATHER_GRAY: u8 = 150;
+
+/// One of these is shown at random as a "lock screen" while the diary is on
+/// but the oracle is unreachable. It stays until the writer double-taps to
+/// dismiss it — it does NOT vanish on its own.
+const CONNECTING_LINES: &[&str] = &[
+    "What you call a defeat, I call the first draft of your will. Begin again — the page is patient.",
+    "A crown is only weight until you learn to carry it. Try once more.",
+    "The flame that flickers has not failed; it is only learning the wind.",
+    "No one is born formidable. They simply refused, one more time, to stay down.",
+    "The ink you spend on doubt would have written you into someone new.",
+    "Fall seven times; the eighth is the one the diary will remember.",
+    "Courage is not the absence of fear — it is fear, walking forward in a steady hand.",
+    "The mountain does not care that you are tired. That is why you must reach it.",
+    "Yesterday's stumble is tomorrow's legend, told in your own hand.",
+    "You are not lost. You are only between who you were and who you intend to be.",
+    "Patience is the quietest form of power. Let it gather.",
+    "The wound that does not end you becomes the door you walk through.",
+    "Greatness is the habit of beginning again, as though beginning were easy.",
+    "Even the longest shadow is cast by something still standing in the light.",
+    "Do not ask the road to be kind. Ask yourself to be equal to it.",
+    "The world remembers those who kept writing after the page went dark.",
+    "One steady line, drawn in the dark, is enough to start a new chapter. Begin it.",
+    "What feels like an ending is merely the plot refusing to settle for less than you.",
+    "Hold the pen until the trembling stops. That is where your real sentence begins.",
+    "Call it behind if you must; I call it being early for the person you are becoming.",
+    "Those who win are the ones who decided, quietly, that they would not stop.",
+    "Turn the page. The story is not finished with you yet.",
+    "Strength is a language learned through repetition. Speak it once more.",
+    "Every master was first a beginner who refused to be excused from the work.",
+    "You came this far on will alone. Will has not failed you yet — try one more time.",
+];
 
 const DRINK_STAGES: u8 = 26;
 
@@ -132,6 +188,16 @@ enum State {
     },
     ConjureLingering {
         until: Instant,
+    },
+    /// Lock screen: the diary is on but the oracle is unreachable. A random
+    /// connecting line is shown and stays until the writer double-taps to
+    /// dismiss it (it does NOT vanish on its own). Pen is gated.
+    OfflineLocked,
+    /// Writing permitted with no oracle; pages are queued locally. A feather
+    /// marks the page as held. Connectivity is probed in the background; when
+    /// it returns, the diary barges in with a reply to the last page.
+    Offline {
+        next_probe: Instant,
     },
 }
 
@@ -258,6 +324,32 @@ struct App {
 
     // set when the journal entry is done and the app should exit
     want_quit: bool,
+
+    // --- wake + connectivity + offline fallback ---
+    /// Last observed CLOCK_BOOTTIME - CLOCK_MONOTONIC (seconds). A jump past
+    /// WAKE_THRESHOLD_SECS means the device just resumed from sleep.
+    boot_delta: i64,
+    /// False until the first loop iteration performs cold-start connectivity.
+    booted: bool,
+    /// True while the offline commit's drink animation runs; on completion it
+    /// returns to Offline instead of waiting on the oracle.
+    offline_drinking: bool,
+    /// Directory holding queued offline pages (`<unix>-<seq>.png`).
+    offline_dir: PathBuf,
+    /// Per-process counter making queued filenames unique within a second.
+    offline_seq: u64,
+    /// True while the barging-in question ("attend to the other pages?") is
+    /// open. Normal vision turns get the awaiting addendum so the writer's
+    /// yes is conveyed through the ⟦summarize:offline⟧ directive.
+    awaiting_offline: bool,
+    /// The in-flight turn is the barging-in turn itself (so its own completion
+    /// is not mistaken for the writer's answer).
+    barging_pending: bool,
+    /// Set when the oracle emitted ⟦summarize:offline⟧ during a turn.
+    want_summarize: bool,
+    /// In-flight background reachability probe (Offline state), or None.
+    /// Drained non-blockingly each tick so a hung resolver never freezes the UI.
+    probe_rx: Option<Receiver<bool>>,
 }
 
 /// Replay cursor over a recalled entry's stored strokes.
@@ -267,10 +359,28 @@ struct Conjure {
     pi: usize,
 }
 
+/// A page written while offline, held on disk until connectivity returns.
+struct QueuedPage {
+    /// Unix seconds at which the page was written — the diary files its
+    /// later answer under this day, not the day it was answered.
+    created_unix: i64,
+    /// Per-second sequence, preserving write order within one second.
+    seq: u64,
+    png: Vec<u8>,
+    /// On-disk path; removed only once the page has been answered and filed,
+    /// so a quit mid-flush leaves the unfiled pages for the next session.
+    path: PathBuf,
+}
+
 impl App {
     fn new(surf: Surface, input: Input, memory: Memory, oracle_cfg: Option<OracleConfig>) -> App {
         let now = Instant::now();
         let journal_dir = configured_journal_dir(&memory);
+        let offline_dir = memory
+            .dir()
+            .parent()
+            .unwrap_or_else(|| memory.dir())
+            .join("offline-queue");
         App {
             surf,
             input,
@@ -307,6 +417,15 @@ impl App {
             conjure: None,
             journal_date: String::new(),
             want_quit: false,
+            boot_delta: 0,
+            booted: false,
+            offline_drinking: false,
+            offline_dir,
+            offline_seq: 0,
+            awaiting_offline: false,
+            barging_pending: false,
+            want_summarize: false,
+            probe_rx: None,
         }
     }
 
@@ -316,6 +435,21 @@ impl App {
                 log!("quitting");
                 break;
             }
+            if !self.booted {
+                // Cold start: probe once. If the oracle is already reachable
+                // and nothing is queued, go straight to Listening (no overlay
+                // flash); otherwise show the connecting overlay.
+                self.booted = true;
+                self.boot_delta = boottime_minus_monotonic_secs();
+                self.cold_start();
+            } else if self.detect_wake() {
+                self.on_wake();
+            }
+            // Sleep deeply while idle: block on the input devices until either
+            // a pen/touch event arrives or the next animation deadline is due,
+            // then drain and tick. Replaces the old 2ms busy-poll.
+            let timeout = self.next_wait_timeout();
+            self.input.wait(timeout);
             let mut quit = false;
             for ev in self.input.poll() {
                 if self.handle_event(ev) {
@@ -327,9 +461,51 @@ impl App {
                 break;
             }
             self.tick();
-            std::thread::sleep(Duration::from_millis(LOOP_MS));
         }
         self.shutdown();
+    }
+
+    /// How long the main loop may block on input before it must wake to
+    /// advance an animation or re-check the oracle channel. Long while idle
+    /// (battery), tight while animating (smoothness), and always overridden
+    /// the instant the pen or touchscreen fires.
+    fn next_wait_timeout(&self) -> Duration {
+        let now = Instant::now();
+        match self.state {
+            State::Listening => {
+                if self.pen_down {
+                    Duration::from_millis(INK_FLUSH_MS)
+                } else if !self.ink.is_empty() {
+                    Duration::from_millis(IDLE_PENDING_MS)
+                } else {
+                    Duration::from_secs(IDLE_LISTEN_SEC)
+                }
+            }
+            State::Drinking { next, .. }
+            | State::Replying { next }
+            | State::FadingReply { next, .. }
+            | State::Conjuring { next }
+            | State::Journaling { next } => next.saturating_duration_since(now),
+            State::Lingering { until }
+            | State::JournalLingering { until }
+            | State::ConjureLingering { until } => until.saturating_duration_since(now),
+            State::Thinking | State::JournalThinking => Duration::from_millis(ORACLE_POLL_MS),
+            // Lock screen: nothing to do but wait for the dismiss double-tap.
+            State::OfflineLocked => Duration::from_secs(IDLE_LISTEN_SEC),
+            // Offline behaves like Listening for input cadence, but when idle
+            // it waits until the next background connectivity probe.
+            State::Offline { next_probe } => {
+                if self.pen_down {
+                    Duration::from_millis(INK_FLUSH_MS)
+                } else if !self.ink.is_empty() {
+                    Duration::from_millis(IDLE_PENDING_MS)
+                } else if self.probe_rx.is_some() {
+                    Duration::from_millis(ORACLE_POLL_MS)
+                } else {
+                    next_probe.saturating_duration_since(now)
+                }
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -360,21 +536,23 @@ impl App {
             InputEvent::Pen(s) => {
                 self.last_activity = Instant::now();
                 match self.state {
-                    State::Listening => self.on_pen_listening(s),
+                    State::Listening | State::Offline { .. } => self.on_pen_listening(s),
                     State::Lingering { .. } | State::ConjureLingering { .. } if s.touching => {
                         self.start_fading()
                     }
-                    _ => {} // pen ignored during animations/oracle wait
+                    _ => {} // pen gated during lock screen / animations / oracle wait
                 }
                 false
             }
             InputEvent::DoubleTap => {
-                // dismiss the reply early
-                if matches!(
-                    self.state,
-                    State::Lingering { .. } | State::ConjureLingering { .. }
-                ) {
-                    self.start_fading();
+                match self.state {
+                    // dismiss the reply early
+                    State::Lingering { .. } | State::ConjureLingering { .. } => {
+                        self.start_fading();
+                    }
+                    // double-tap dismisses the offline lock screen
+                    State::OfflineLocked => self.dismiss_lock(),
+                    _ => {}
                 }
                 false
             }
@@ -522,12 +700,18 @@ impl App {
             .journal_enabled
             .then(|| journal::today_ymd(self.tz_offset_hours));
         let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        let extra = if self.awaiting_offline {
+            Some(oracle::AWAITING_ADDENDUM)
+        } else {
+            None
+        };
         oracle::spawn(
             self.oracle_cfg.clone(),
             png,
             self.memory.history(),
             time_context,
             journal_today,
+            extra,
             tx,
         );
 
@@ -565,6 +749,9 @@ impl App {
                         log!("ignoring duplicate recall directive for {date}");
                     }
                 }
+                OracleEvent::SummarizeOffline => {
+                    self.want_summarize = true;
+                }
                 OracleEvent::Done => {
                     self.oracle_done = true;
                 }
@@ -573,6 +760,24 @@ impl App {
     }
 
     fn begin_reply(&mut self) {
+        // Resolve the barging-in question if the just-finished turn was the
+        // writer's answer to it (not the barging-in turn itself).
+        if self.awaiting_offline && !self.barging_pending {
+            if self.want_summarize {
+                // yes — address all remaining offline pages in one go
+                self.awaiting_offline = false;
+                self.want_summarize = false;
+                self.summarize_start();
+                return;
+            }
+            // no (or the writer moved on) — drop the question; any remaining
+            // offline pages stay queued on disk for a later session.
+            self.awaiting_offline = false;
+        }
+        if self.barging_pending {
+            // this turn IS the barging-in reply; the question is now open
+            self.barging_pending = false;
+        }
         if self.reply_sentences.is_empty() && self.oracle_done {
             // a recall directive instead of a prose reply?
             if let Some(date) = self.show_entry.take() {
@@ -776,30 +981,25 @@ impl App {
     fn save_journal_and_quit(&mut self) {
         let today = std::mem::take(&mut self.journal_date);
         let text = self.reply_sentences.join(" ");
-        if text.is_empty() {
-            log!("journal entry empty (oracle failed?), not saving");
-        } else {
+        if !text.is_empty() {
             let strokes = self
                 .plan
                 .as_ref()
                 .map(|p| p.strokes.clone())
                 .unwrap_or_default();
             match journal::save_entry(&self.journal_dir, &today, &text, &strokes) {
-                Ok(()) => {
-                    log!("journal entry saved for {today}");
-                    let time_context =
-                        journal::current_time_context(&self.tz_name, self.tz_offset_hours);
-                    match journal::publish_diary(
-                        &self.journal_dir,
-                        &self.library_dir,
-                        &time_context,
-                    ) {
-                        Ok(path) => log!("stock-library diary refreshed from {}", path.display()),
-                        Err(error) => log!("stock-library diary refresh failed: {error}"),
-                    }
-                }
+                Ok(()) => log!("journal entry saved for {today}"),
                 Err(e) => log!("journal save failed: {e}"),
             }
+        } else {
+            log!("journal entry empty (oracle failed?), nothing new to save");
+        }
+        // Always refresh the stock-library EPUB from whatever entries exist:
+        // a failed "today" must not suppress the whole library document.
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        match journal::publish_diary(&self.journal_dir, &self.library_dir, &time_context) {
+            Ok(path) => log!("stock-library diary refreshed from {}", path.display()),
+            Err(error) => log!("stock-library diary refresh skipped: {error}"),
         }
         self.want_quit = true;
     }
@@ -924,6 +1124,371 @@ impl App {
         cleanup_page_png();
     }
 
+    // --- wake + connectivity + offline fallback ----------------------------------
+
+    /// CLOCK_BOOTTIME advances during suspend, CLOCK_MONOTONIC does not, so
+    /// their difference grows by exactly the time spent suspended. A jump
+    /// past WAKE_THRESHOLD_SECS means the device just resumed.
+    fn detect_wake(&mut self) -> bool {
+        let delta = boottime_minus_monotonic_secs();
+        let woke = self.boot_delta != 0 && delta - self.boot_delta >= WAKE_THRESHOLD_SECS;
+        self.boot_delta = delta;
+        woke
+    }
+
+    /// Start a background reachability probe if one isn't already in flight.
+    fn ensure_probe(&mut self) {
+        if self.probe_rx.is_some() {
+            return;
+        }
+        self.probe_rx = oracle::spawn_probe(self.oracle_cfg.as_ref(), PROBE_TIMEOUT);
+    }
+
+    /// Non-blocking drain of the in-flight probe. Returns Some(reachable) once
+    /// it has answered (or its thread died), None while still pending.
+    fn drain_probe(&mut self) -> Option<bool> {
+        let received = self.probe_rx.as_ref().map(|rx| rx.try_recv());
+        match received {
+            None => None,
+            Some(Ok(reachable)) => {
+                self.probe_rx = None;
+                Some(reachable)
+            }
+            Some(Err(TryRecvError::Empty)) => None,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.probe_rx = None;
+                Some(false)
+            }
+        }
+    }
+
+    /// Cold start: probe once. Already reachable (and nothing queued) goes
+    /// straight to Listening — no lock screen on a normal online launch.
+    fn cold_start(&mut self) {
+        self.finish_turn();
+        if oracle::endpoint_reachable(self.oracle_cfg.as_ref(), COLD_PROBE_TIMEOUT) {
+            if self.offline_queue_count() > 0 {
+                self.barging_in_start();
+            } else {
+                self.state = State::Listening;
+                self.last_activity = Instant::now();
+                self.last_flush = Instant::now();
+            }
+        } else {
+            self.enter_offline_locked();
+        }
+    }
+
+    /// The device just resumed. Discard any turn frozen mid-flight and decide
+    /// afresh: online (barging in if pages wait) or the lock screen. Either
+    /// path repaints, fixing the white-screen-on-wake bug.
+    fn on_wake(&mut self) {
+        log!("wake detected — re-establishing connectivity");
+        self.offline_drinking = false;
+        self.finish_turn();
+        if oracle::endpoint_reachable(self.oracle_cfg.as_ref(), COLD_PROBE_TIMEOUT) {
+            if self.offline_queue_count() > 0 {
+                self.barging_in_start();
+            } else {
+                self.surf.full_white_refresh();
+                self.state = State::Listening;
+                self.last_activity = Instant::now();
+                self.last_flush = Instant::now();
+            }
+        } else {
+            self.enter_offline_locked();
+        }
+    }
+
+    /// Show the lock screen: a random line that stays until double-tapped.
+    fn enter_offline_locked(&mut self) {
+        self.probe_rx = None;
+        let line = (self.turn_seed % CONNECTING_LINES.len() as u64) as usize;
+        self.turn_seed = self
+            .turn_seed
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
+        self.surf.full_white_refresh();
+        self.paint_text_static(CONNECTING_LINES[line]);
+        self.state = State::OfflineLocked;
+        log!("offline: lock screen shown (double-tap to dismiss)");
+    }
+
+    /// Double-tap dismissed the lock screen. Still offline -> writable page
+    /// with the feather; online -> Listening (or barging in if pages wait).
+    fn dismiss_lock(&mut self) {
+        self.probe_rx = None;
+        if oracle::endpoint_reachable(self.oracle_cfg.as_ref(), COLD_PROBE_TIMEOUT) {
+            if self.offline_queue_count() > 0 {
+                self.barging_in_start();
+            } else {
+                self.surf.full_white_refresh();
+                self.state = State::Listening;
+                self.last_activity = Instant::now();
+                self.last_flush = Instant::now();
+            }
+        } else {
+            self.surf.full_white_refresh();
+            self.paint_feather();
+            self.state = State::Offline {
+                next_probe: Instant::now() + Duration::from_secs(PROBE_INTERVAL_SEC),
+            };
+            self.last_activity = Instant::now();
+            self.last_flush = Instant::now();
+        }
+    }
+
+    /// Connectivity returned while writing offline. If pages are queued, barge
+    /// in with a reply to the last one; otherwise just return to listening.
+    fn on_back_online(&mut self) {
+        self.probe_rx = None;
+        if self.offline_queue_count() == 0 {
+            self.surf.full_white_refresh();
+            self.state = State::Listening;
+            self.last_activity = Instant::now();
+            self.last_flush = Instant::now();
+            return;
+        }
+        self.barging_in_start();
+    }
+
+    // --- offline reconnect: barging-in + one-shot summary -----------------------
+
+    /// Clear per-turn reply machinery and blank the page for a fresh reply.
+    fn begin_standalone_turn(&mut self) {
+        self.reply_sentences.clear();
+        self.transcript.clear();
+        self.oracle_done = false;
+        self.saved_turn = false;
+        self.plan = None;
+        self.draw_si = 0;
+        self.draw_pi = 0;
+        self.show_entry = None;
+        self.surf.full_white_refresh();
+    }
+
+    /// Reply to the writer's most recent offline page, opening with an apology
+    /// for the abrupt return and asking whether to address the rest. The other
+    /// pages stay queued in case the writer says yes.
+    fn barging_in_start(&mut self) {
+        let mut queue = match self.load_offline_queue() {
+            Ok(q) => q,
+            Err(e) => {
+                log!("offline queue read failed: {e}");
+                Vec::new()
+            }
+        };
+        if queue.is_empty() {
+            self.state = State::Listening;
+            self.last_activity = Instant::now();
+            self.last_flush = Instant::now();
+            return;
+        }
+        // newest page is last after sort_by_key((created_unix, seq))
+        let last = queue.pop().unwrap();
+        let _ = std::fs::remove_file(&last.path);
+        self.begin_standalone_turn();
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        oracle::spawn_barging_in(self.oracle_cfg.clone(), last.png, time_context, tx);
+        self.barging_pending = true;
+        self.awaiting_offline = true;
+        self.state = State::Thinking;
+        log!("barging in: replying to the last offline page");
+    }
+
+    /// Address every remaining offline page in one unified reply, then the
+    /// conversation continues. Consumes (deletes) all queued pages.
+    fn summarize_start(&mut self) {
+        let queue = match self.load_offline_queue() {
+            Ok(q) => q,
+            Err(e) => {
+                log!("offline queue read failed: {e}");
+                Vec::new()
+            }
+        };
+        if queue.is_empty() {
+            self.state = State::Listening;
+            self.last_activity = Instant::now();
+            self.last_flush = Instant::now();
+            return;
+        }
+        let mut pngs = Vec::with_capacity(queue.len());
+        for p in &queue {
+            pngs.push(p.png.clone());
+            let _ = std::fs::remove_file(&p.path);
+        }
+        self.begin_standalone_turn();
+        let time_context = journal::current_time_context(&self.tz_name, self.tz_offset_hours);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        oracle::spawn_summarize(self.oracle_cfg.clone(), pngs, time_context, tx);
+        self.state = State::Thinking;
+        log!("summarizing {} offline pages in one go", queue.len());
+    }
+
+    // --- offline queue (disk) ----------------------------------------------------
+
+    fn queue_offline_page(&mut self, png: &[u8]) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.offline_dir)?;
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        self.offline_seq = self.offline_seq.wrapping_add(1);
+        let path = self
+            .offline_dir
+            .join(format!("{created}-{}.png", self.offline_seq));
+        std::fs::write(&path, png)?;
+        log!("offline page queued: {}", path.display());
+        Ok(())
+    }
+
+    fn load_offline_queue(&self) -> std::io::Result<Vec<QueuedPage>> {
+        let mut out: Vec<QueuedPage> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.offline_dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(stem) = name.strip_suffix(".png") else {
+                    continue;
+                };
+                let (secs_s, seq_s) = stem.split_once('-').unwrap_or((stem, "0"));
+                let created_unix = secs_s.parse().unwrap_or(0);
+                let seq: u64 = seq_s.parse().unwrap_or(0);
+                if let Ok(png) = std::fs::read(&path) {
+                    out.push(QueuedPage {
+                        created_unix,
+                        seq,
+                        png,
+                        path,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|p| (p.created_unix, p.seq));
+        Ok(out)
+    }
+
+    fn offline_queue_count(&self) -> usize {
+        std::fs::read_dir(&self.offline_dir)
+            .map(|rd| {
+                rd.filter(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|s| s.ends_with(".png")))
+                        .unwrap_or(false)
+                })
+                .count()
+            })
+            .unwrap_or(0)
+    }
+
+    // --- offline commit (write with no oracle) -----------------------------------
+
+    fn maybe_commit_offline(&mut self) {
+        if self.pen_down
+            || self.ink.is_empty()
+            || self.last_activity.elapsed().as_millis() < self.animation.idle_ms as u128
+        {
+            return;
+        }
+        self.surf.flush_dirty(fb::WAVEFORM_DU);
+        self.surf.wait_idle();
+        let Some(bbox) = self.ink.bbox() else {
+            return;
+        };
+        let png = match ink::rasterize_page_png(&self.surf.shadow, bbox) {
+            Ok(p) => p,
+            Err(e) => {
+                log!("offline page rasterization failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = self.queue_offline_page(&png) {
+            log!("offline queue write failed: {e}");
+        }
+        self.turn_strokes = self.ink.strokes.clone();
+        self.reply_sentences.clear();
+        self.transcript.clear();
+        self.oracle_done = false;
+        self.plan = None;
+        self.draw_si = 0;
+        self.draw_pi = 0;
+        self.turn_seed = self
+            .turn_seed
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223);
+        // drink the ink away, then return to Offline (not the oracle)
+        let ordered: Vec<ink::Point> = self.ink.strokes.iter().flatten().copied().collect();
+        self.dissolve = ink::Dissolve::plan_ordered(&self.surf.shadow, &ordered, DRINK_STAGES);
+        self.offline_drinking = true;
+        self.state = State::Drinking {
+            stage: 0,
+            next: Instant::now(),
+        };
+    }
+
+    /// The offline drink finished: the ink is held to the queue; redraw the
+    /// feather and keep listening offline.
+    fn finish_offline_drink(&mut self) {
+        self.surf.full_white_refresh();
+        self.paint_feather();
+        self.state = State::Offline {
+            next_probe: Instant::now() + Duration::from_secs(PROBE_INTERVAL_SEC),
+        };
+        self.last_activity = Instant::now();
+        self.last_flush = Instant::now();
+    }
+
+    // --- static painting (lock-screen quotes, replies, feather) -----------------
+
+    fn paint_text_static(&mut self, text: &str) {
+        if let Some(plan) = script::plan_reply(text, self.turn_seed) {
+            draw_strokes_static(&mut self.surf, &plan.strokes);
+            self.surf.flush_dirty(fb::WAVEFORM_GC16);
+            self.surf.wait_idle();
+        } else {
+            log!("could not lay out static text");
+        }
+    }
+
+    /// A small feather glyph in the top-right corner: the quiet indicator
+    /// that pages are being held offline. Hand-drawn as vector strokes.
+    fn paint_feather(&mut self) {
+        let cx = fb::WIDTH - 44;
+        let top = 22;
+        let g = FEATHER_GRAY;
+        let shaft: [(i32, i32); 5] = [
+            (cx, top),
+            (cx - 1, top + 6),
+            (cx - 2, top + 12),
+            (cx - 3, top + 18),
+            (cx - 4, top + 24),
+        ];
+        for w in shaft.windows(2) {
+            ink::brush_line(&mut self.surf, w[0].0, w[0].1, 1, w[1].0, w[1].1, 1, g);
+        }
+        let barbs: [((i32, i32), (i32, i32)); 7] = [
+            ((cx, top + 2), (cx - 5, top - 1)),
+            ((cx - 1, top + 6), (cx - 7, top + 4)),
+            ((cx - 1, top + 9), (cx - 8, top + 8)),
+            ((cx - 2, top + 12), (cx - 9, top + 12)),
+            ((cx - 2, top + 15), (cx - 9, top + 16)),
+            ((cx - 3, top + 18), (cx - 9, top + 20)),
+            ((cx - 4, top + 21), (cx - 8, top + 24)),
+        ];
+        for ((x0, y0), (x1, y1)) in barbs {
+            ink::brush_line(&mut self.surf, x0, y0, 1, x1, y1, 1, g);
+        }
+        self.surf
+            .mark_dirty(Rect::new(cx - 12, top - 3, cx + 2, top + 27));
+        self.surf.flush_dirty(fb::WAVEFORM_GC16);
+    }
+
     // --- tick ---------------------------------------------------------------------
 
     fn tick(&mut self) {
@@ -951,11 +1516,17 @@ impl App {
                     // the page has drunk the writer's ink
                     self.ink.clear();
                     self.dissolve = None;
-                    self.drain_oracle();
-                    if self.oracle_done {
-                        self.begin_reply();
+                    if self.offline_drinking {
+                        // offline commit: ink held to the queue, no oracle turn
+                        self.offline_drinking = false;
+                        self.finish_offline_drink();
                     } else {
-                        self.state = State::Thinking;
+                        self.drain_oracle();
+                        if self.oracle_done {
+                            self.begin_reply();
+                        } else {
+                            self.state = State::Thinking;
+                        }
                     }
                 } else {
                     self.state = State::Drinking {
@@ -1034,7 +1605,75 @@ impl App {
                     };
                 }
             }
+            State::OfflineLocked => {
+                // lock screen: nothing to do but wait for the dismiss double-tap
+            }
+            State::Offline { next_probe } => {
+                if self.last_flush.elapsed() >= Duration::from_millis(INK_FLUSH_MS) {
+                    self.surf.flush_dirty(fb::WAVEFORM_DU);
+                    self.last_flush = now;
+                }
+                self.maybe_commit_offline();
+                // keep probing in the background; a state change from commit
+                // means we are mid-drink and must not clobber it.
+                if matches!(self.state, State::Offline { .. }) {
+                    if now >= next_probe {
+                        self.ensure_probe();
+                    }
+                    match self.drain_probe() {
+                        // wait until the pen lifts before barging in, so an
+                        // in-progress stroke isn't interrupted.
+                        Some(true) if !self.pen_down => self.on_back_online(),
+                        // online but the pen is down: hold, re-probe shortly.
+                        Some(_) => {
+                            self.state = State::Offline {
+                                next_probe: now + Duration::from_secs(PROBE_INTERVAL_SEC),
+                            };
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
+    }
+}
+
+/// CLOCK_BOOTTIME minus CLOCK_MONOTONIC, in seconds. BOOTTIME advances while
+/// suspended and MONOTONIC does not, so this measures cumulative suspend time.
+fn boottime_minus_monotonic_secs() -> i64 {
+    unsafe {
+        let mut bt: libc::timespec = std::mem::zeroed();
+        let mut mt: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut bt);
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mt);
+        // tv_sec is c_long (i32 on the 32-bit armv7 target, i64 on 64-bit);
+        // widen before subtracting so this is correct and overflow-safe on both.
+        (bt.tv_sec as i64) - (mt.tv_sec as i64)
+    }
+}
+
+/// Draw a laid-out stroke plan all at once (static, black) — used for the
+/// connecting quotes, the offline offer, and rendered queued replies.
+fn draw_strokes_static(surf: &mut Surface, strokes: &[Vec<(i32, i32)>]) {
+    let mut r = Rect::new(fb::WIDTH, fb::HEIGHT, 0, 0);
+    let mut touched = false;
+    for stroke in strokes {
+        if let Some(&(x, y)) = stroke.first() {
+            surf.fill_circle(x, y, REPLY_BRUSH_R, 0);
+            r.include(Rect::around(x, y, REPLY_BRUSH_R));
+            touched = true;
+        }
+        for w in stroke.windows(2) {
+            let (x0, y0) = w[0];
+            let (x1, y1) = w[1];
+            ink::brush_line(surf, x0, y0, REPLY_BRUSH_R, x1, y1, REPLY_BRUSH_R, 0);
+            r.include(Rect::around(x0, y0, REPLY_BRUSH_R));
+            r.include(Rect::around(x1, y1, REPLY_BRUSH_R));
+            touched = true;
+        }
+    }
+    if touched {
+        surf.mark_dirty(r);
     }
 }
 
@@ -1145,5 +1784,25 @@ mod app_tests {
         let mut sentences = vec!["One answer.".to_string(), "Another answer.".to_string()];
         constrain_reply(&mut sentences);
         assert_eq!(sentences, vec!["One answer. Another answer."]);
+    }
+
+    #[test]
+    fn connecting_lines_are_exactly_25_and_keep_the_voice() {
+        assert_eq!(CONNECTING_LINES.len(), 25, "the spec calls for 25 lines");
+        let mut openings = std::collections::HashSet::new();
+        for (i, line) in CONNECTING_LINES.iter().enumerate() {
+            assert!(!line.trim().is_empty(), "line {i} is empty");
+            // the connecting overlay must read as the diary, not as a status bar
+            let low = line.to_ascii_lowercase();
+            for forbidden in ["wifi", "wi-fi", "oracle", "loading", "connecting"] {
+                assert!(
+                    !low.contains(forbidden),
+                    "line {i} leaks the term {forbidden:?}: {line}"
+                );
+            }
+            // distinct openings (the persona forbids repeated salutations)
+            let opening = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            assert!(openings.insert(opening), "line {i} repeats an opening");
+        }
     }
 }
